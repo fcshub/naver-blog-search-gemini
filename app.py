@@ -35,14 +35,14 @@ MAX_RETRIES = 2
 RETRY_WAIT = 65
 
 # 수집
-SORT_PLAN = [("sim", 20), ("date", 30)]
-MAX_TOTAL_ITEMS = 60       # 검색 결과 상한
+SORT_PLAN = [("sim", 40), ("date", 60)]
+MAX_TOTAL_ITEMS = 50       # 검색 결과 상한
 NAVER_DELAY = 0.15
 
 # 크롤링
-CRAWL_TOP_N = 15           # 본문을 실제로 긁을 글 수
-MAX_BODY_CHARS = 2500      # 글 1건당 본문 상한
-CRAWL_WORKERS = 5          # 동시 요청 수 (너무 올리면 차단 위험)
+CRAWL_TOP_N = 50           # 본문을 실제로 긁을 글 수
+MAX_BODY_CHARS = 1800      # 글 1건당 본문 상한
+CRAWL_WORKERS = 3          # 동시 요청 수 (너무 올리면 차단 위험)
 CRAWL_TIMEOUT = 8
 
 UA = (
