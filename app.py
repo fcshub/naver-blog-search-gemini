@@ -19,12 +19,11 @@ genai.configure(api_key=GEMINI_API_KEY)
 # 새 버전이 나오면 이 리스트 맨 위에 이름만 추가하면 됩니다.
 MODEL_PREFERENCES = [
     "gemini-3.7-flash",   # 사용자가 지정한 모델 (존재 여부 미확인)
-    "gemini-3-flash",
     "gemini-2.5-flash",   # 2026-05 기준 무료 등급의 안정적인 기본값
 ]
 
-MAX_DESC_CHARS = 1200   # 블로그 1건당 본문 상한 (TPM 초과 방지)
-MAX_RETRIES = 3         # 429 발생 시 재시도 횟수
+MAX_DESC_CHARS = 500   # 블로그 1건당 본문 상한 (TPM 초과 방지)
+MAX_RETRIES = 1         # 429 발생 시 재시도 횟수
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -126,7 +125,10 @@ def build_prompt(query: str, mode: str, raw_data: str, custom: str) -> str:
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def generate(prompt: str, model_name: str) -> str:
-    model = genai.GenerativeModel(model_name)
+    model = genai.GenerativeModel(
+        model_name,
+        generation_config={"max_output_tokens": 2048},
+    )
 
     for attempt in range(MAX_RETRIES):
         try:
