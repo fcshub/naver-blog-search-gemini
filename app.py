@@ -22,7 +22,7 @@ MODEL_PREFERENCES = [
     "gemini-2.5-flash",   # 2026-05 기준 무료 등급의 안정적인 기본값
 ]
 
-MAX_DESC_CHARS = 500   # 블로그 1건당 본문 상한 (TPM 초과 방지)
+MAX_DESC_CHARS = 2000   # 블로그 1건당 본문 상한 (TPM 초과 방지)
 MAX_RETRIES = 1         # 429 발생 시 재시도 횟수
 
 
@@ -70,7 +70,7 @@ def fetch_naver_blogs(query: str) -> list[str]:
         "X-NCP-APIGW-API-KEY-ID": NAVER_CLIENT_ID,
         "X-NCP-APIGW-API-KEY": NAVER_CLIENT_SECRET,
     }
-    params = {"query": query, "display": 20, "sort": "sim"}
+    params = {"query": query, "display": 50, "sort": "sim"}
 
     res = requests.get(url, headers=headers, params=params, timeout=10)
     res.raise_for_status()
