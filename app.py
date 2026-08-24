@@ -22,13 +22,12 @@ MODEL_PREFERENCES = [
 ]
 
 MAX_DESC_CHARS = 2000
-MAX_TOTAL_ITEMS = 120      # 중복 제거 후 최종 상한 (토큰 폭주 방지)
-MAX_OUTPUT_TOKENS = 16384  # thinking 모델은 사고 토큰도 여기 포함됨
+MAX_TOTAL_ITEMS = 80
+MAX_OUTPUT_TOKENS = 16384
 MAX_RETRIES = 2
-RETRY_WAIT = 65            # TPM 윈도우가 1분이라 그보다 길게
-NAVER_DELAY = 0.15         # 연속 호출 간 간격 (초)
+RETRY_WAIT = 65
+NAVER_DELAY = 0.15
 
-# 정렬별 수집량: 최신순에 비중을 둠 (상업적 최적화가 덜 된 글이 많음)
 SORT_PLAN = [("sim", 20), ("date", 40)]
 
 MODES = [
@@ -38,7 +37,6 @@ MODES = [
     "✏️ 내 맘대로 직접 지시",
 ]
 
-# 모드별 검색어 확장 접미사. 부정·후기성 단어가 협찬글을 자연스럽게 걸러냄.
 QUERY_SUFFIXES = {
     MODES[0]: ["", "후기", "웨이팅", "솔직"],
     MODES[1]: ["", "후기", "단점", "문제"],
@@ -59,8 +57,8 @@ def list_text_models() -> list[str]:
     ]
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def resolve_model() -> str:
+    """캐시하지 않음 — MODEL_PREFERENCES 수정이 즉시 반영되도록."""
     available = list_text_models()
 
     for name in MODEL_PREFERENCES:
@@ -71,7 +69,7 @@ def resolve_model() -> str:
         m = re.search(r"(\d+(?:\.\d+)?)", name)
         return float(m.group(1)) if m else 0.0
 
-    flash = [n for n in available if "flash" in n.lower() and "lite" not in n.lower()]
+    flash = [n for n in available if "flash" in n.lower()]
     if flash:
         return max(flash, key=version_of)
 
@@ -99,7 +97,6 @@ def _fetch_once(query: str, sort: str, display: int) -> list[dict]:
 
 
 def expand_queries(base: str, mode: str) -> list[str]:
-    """모드에 맞춰 검색어를 여러 각도로 확장."""
     base = base.strip()
     seen, out = set(), []
     for suffix in QUERY_SUFFIXES.get(mode, ["", "후기"]):
@@ -112,7 +109,6 @@ def expand_queries(base: str, mode: str) -> list[str]:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def collect_blogs(base_query: str, mode: str) -> tuple[list[dict], list[str]]:
-    """확장 검색어 × 정렬 조합으로 수집 후 링크 기준 중복 제거."""
     queries = expand_queries(base_query, mode)
 
     seen: set[str] = set()
@@ -123,7 +119,7 @@ def collect_blogs(base_query: str, mode: str) -> tuple[list[dict], list[str]]:
             try:
                 items = _fetch_once(q, sort, display)
             except requests.RequestException:
-                continue  # 일부 쿼리 실패는 무시하고 계속
+                continue
 
             for it in items:
                 link = it.get("link", "")
@@ -134,11 +130,9 @@ def collect_blogs(base_query: str, mode: str) -> tuple[list[dict], list[str]]:
                     "title": _strip_tags(it.get("title", "")),
                     "desc": _strip_tags(it.get("description", ""))[:MAX_DESC_CHARS],
                     "date": it.get("postdate", ""),
-                    "via": q,
                 })
             time.sleep(NAVER_DELAY)
 
-    # 최신순 우선으로 정렬한 뒤 상한 적용
     result.sort(key=lambda b: b["date"], reverse=True)
     return result[:MAX_TOTAL_ITEMS], queries
 
@@ -161,25 +155,24 @@ COMMON_RULES = """
 - 데이터에 없는 내용은 절대 추측하거나 지어내지 마세요. 근거가 없으면 "정보 부족"이라고 명시하세요.
 - 협찬·체험단으로 의심되는 글도 버리지 말고 활용하되, 용도를 구분하세요.
   · 사실 정보(메뉴, 가격, 위치, 영업시간, 주차)는 그대로 인용해도 됩니다.
-  · 평가·감상(맛있다, 분위기 좋다)은 신뢰도를 낮춰 취급하고, 필요하면 협찬 의심을 짧게 표시하세요.
-- 여러 항목에서 반복 언급된 내용을 우선하고, 몇 건에서 나왔는지 밝히세요. 단일 출처면 그렇다고 쓰세요.
-- 마지막에 "⚠️ 데이터 한계" 항목을 두고, 이번 분석에서 확인하지 못한 부분을 2~3줄로 정리하세요.
+  · 평가·감상(맛있다, 분위기 좋다)은 신뢰도를 낮춰 취급하세요.
+- 여러 항목에서 반복 언급된 내용을 우선하고, 몇 건에서 나왔는지 밝히세요.
+- 마지막에 "⚠️ 데이터 한계" 항목을 두고 확인하지 못한 부분을 2~3줄로 정리하세요.
 """
 
 SYSTEM_PROMPTS = {
     MODES[0]: """
 [분석 지침 — 맛집/핫플]
-1. 작성 날짜를 확인하세요. 최근 12개월 내 언급이 없는 곳은 폐업 가능성을 함께 표시하세요.
-2. 추천 장소 3~5곳을 선정하고 각각 다음을 정리하세요.
+1. 작성 날짜를 확인하세요. 최근 12개월 내 언급이 없는 곳은 폐업 가능성을 표시하세요.
+2. 추천 장소 3~5곳을 선정하고 각각 정리하세요.
    · 언급 건수 · 인기 메뉴와 가격대 · 불만족 포인트(웨이팅, 주차, 서비스)
-3. 불만족 언급이 데이터에 없으면 "언급 없음"이라고 쓰고, 없는 단점을 만들어내지 마세요.
+3. 불만족 언급이 없으면 "언급 없음"이라고 쓰고, 없는 단점을 만들지 마세요.
 """,
     MODES[1]: """
 [분석 지침 — IT/기술]
 1. 해당 기술·제품의 최신 동향과 장단점을 요약하세요.
 2. 실무자·개발자 관점의 문제점(이슈, 한계, 호환성)을 중심으로 정리하세요.
 3. 시점에 따라 평가가 달라진 부분이 있으면 날짜를 근거로 짚어주세요.
-4. 마케팅 문구는 배제하고 검증 가능한 팩트 위주로 쓰세요.
 """,
     MODES[2]: """
 [분석 지침 — 여행/데이트]
@@ -205,82 +198,125 @@ def build_prompt(query: str, mode: str, raw_data: str, custom: str, queries: lis
 """
 
 
+def build_light_context(query: str, mode: str, first_result: str) -> str:
+    """후속 질문용 경량 컨텍스트 — 원본 데이터 제외."""
+    return f"""'{query}'에 대해 네이버 블로그를 검색하고 [{mode}] 관점으로 분석한 결과입니다.
+아래는 그 분석 결과 전문입니다. 이어지는 질문에는 이 내용을 근거로 답하세요.
+여기 없는 내용을 물으면 추측하지 말고 "원본 데이터에 없어 답변할 수 없습니다"라고 하세요.
+
+[1차 분석 결과]
+{first_result}
+"""
+
+
 # ---------------------------------------------------------------------------
 # Gemini 호출
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
-def count_tokens(prompt: str, model_name: str) -> int:
-    return genai.GenerativeModel(model_name).count_tokens(prompt).total_tokens
+def _extract(resp) -> str:
+    if not resp.candidates:
+        fb = getattr(resp, "prompt_feedback", None)
+        return f"⚠️ 응답이 생성되지 않았습니다 (프롬프트 차단 가능성)\n\n```\n{fb}\n```"
+
+    cand = resp.candidates[0]
+    text = "".join(p.text for p in cand.content.parts if hasattr(p, "text"))
+
+    if not text.strip():
+        return (
+            "⚠️ 응답 본문이 비어 있습니다.\n\n"
+            f"- finish_reason: `{cand.finish_reason}`\n"
+            f"- usage: `{resp.usage_metadata}`\n\n"
+            "`MAX_TOKENS`라면 상단의 `MAX_OUTPUT_TOKENS`를 올리세요."
+        )
+    return text
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def generate(prompt: str, model_name: str) -> str:
-    model = genai.GenerativeModel(
+def make_model(model_name: str):
+    return genai.GenerativeModel(
         model_name,
         generation_config={"max_output_tokens": MAX_OUTPUT_TOKENS},
     )
 
+
+def generate(prompt: str, model_name: str) -> str:
+    model = make_model(model_name)
     for attempt in range(MAX_RETRIES):
         try:
-            resp = model.generate_content(prompt)
-
-            if not resp.candidates:
-                fb = getattr(resp, "prompt_feedback", None)
-                return f"⚠️ 응답이 생성되지 않았습니다 (프롬프트 차단 가능성)\n\n```\n{fb}\n```"
-
-            cand = resp.candidates[0]
-            text = "".join(p.text for p in cand.content.parts if hasattr(p, "text"))
-
-            if not text.strip():
-                return (
-                    "⚠️ 응답 본문이 비어 있습니다.\n\n"
-                    f"- finish_reason: `{cand.finish_reason}`\n"
-                    f"- usage: `{resp.usage_metadata}`\n\n"
-                    "`MAX_TOKENS`라면 상단의 `MAX_OUTPUT_TOKENS`를 올리세요."
-                )
-            return text
-
+            return _extract(model.generate_content(prompt))
         except gexc.ResourceExhausted:
             if attempt == MAX_RETRIES - 1:
                 raise
             time.sleep(RETRY_WAIT)
-
     raise RuntimeError("unreachable")
 
 
-def analyze(query: str, mode: str, custom: str = ""):
+def continue_chat(history: list[dict], question: str, model_name: str) -> str:
+    """history: [{'role': 'user'|'model', 'parts': [str]}, ...]"""
+    model = make_model(model_name)
+    chat = model.start_chat(history=history)
+    for attempt in range(MAX_RETRIES):
+        try:
+            return _extract(chat.send_message(question))
+        except gexc.ResourceExhausted:
+            if attempt == MAX_RETRIES - 1:
+                raise
+            time.sleep(RETRY_WAIT)
+    raise RuntimeError("unreachable")
+
+
+def run_analysis(query: str, mode: str, custom: str = ""):
     meta: dict = {}
 
     try:
         blogs, queries = collect_blogs(query, mode)
     except Exception as e:
-        return None, f"❌ 네이버 검색 실패: {type(e).__name__}: {e}", meta
+        return None, f"❌ 네이버 검색 실패: {type(e).__name__}: {e}", meta, None
 
     if not blogs:
-        return None, "⚠️ 검색 결과가 없습니다.", meta
+        return None, "⚠️ 검색 결과가 없습니다.", meta, None
 
     meta["count"] = len(blogs)
-    meta["queries"] = queries
 
     try:
         model_name = resolve_model()
     except Exception as e:
-        return None, f"❌ 모델 확인 실패: {e}", meta
+        return None, f"❌ 모델 확인 실패: {e}", meta, None
 
     prompt = build_prompt(query, mode, format_blogs(blogs), custom, queries)
+    meta["chars"] = len(prompt)
 
     try:
-        meta["tokens"] = count_tokens(prompt, model_name)
-    except Exception:
-        meta["tokens"] = None
-
-    try:
-        return model_name, generate(prompt, model_name), meta
+        return model_name, generate(prompt, model_name), meta, prompt
     except gexc.ResourceExhausted as e:
         detail = "\n".join(str(d) for d in (getattr(e, "details", []) or []))
-        return model_name, f"❌ 쿼터/결제 오류\n\n```\n{e.message}\n\n{detail}\n```", meta
+        return model_name, f"❌ 쿼터/결제 오류\n\n```\n{e.message}\n\n{detail}\n```", meta, None
     except Exception as e:
-        return model_name, f"❌ 분석 중 오류: {type(e).__name__}: {e}", meta
+        return model_name, f"❌ 분석 중 오류: {type(e).__name__}: {e}", meta, None
+
+
+# ---------------------------------------------------------------------------
+# 세션 상태
+# ---------------------------------------------------------------------------
+if "ctx" not in st.session_state:
+    st.session_state.ctx = None   # 분석 컨텍스트
+if "turns" not in st.session_state:
+    st.session_state.turns = []   # [(question, answer), ...]
+
+
+def build_history(ctx: dict, carry_raw: bool) -> list[dict]:
+    """1차 분석 + 이후 대화를 Gemini history 형식으로 조립."""
+    if carry_raw and ctx.get("prompt"):
+        opener = ctx["prompt"]
+    else:
+        opener = build_light_context(ctx["query"], ctx["mode"], ctx["result"])
+
+    history = [
+        {"role": "user", "parts": [opener]},
+        {"role": "model", "parts": [ctx["result"]]},
+    ]
+    for q, a in st.session_state.turns:
+        history.append({"role": "user", "parts": [q]})
+        history.append({"role": "model", "parts": [a]})
+    return history
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +324,7 @@ def analyze(query: str, mode: str, custom: str = ""):
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="네이버 AI 분석기", page_icon="🔍")
 st.title("🔍 네이버 다목적 AI 분석기")
-st.caption("검색어를 여러 각도로 확장해 수집하고 Gemini로 분석합니다.")
+st.caption("검색어를 여러 각도로 확장해 수집하고, 결과에 대해 이어서 질문할 수 있습니다.")
 
 with st.sidebar:
     st.subheader("⚙️ 상태")
@@ -298,14 +334,27 @@ with st.sidebar:
         st.error(str(e))
 
     with st.expander("사용 가능한 모델"):
-        try:
-            st.code("\n".join(list_text_models()))
-        except Exception as e:
-            st.error(f"조회 실패: {e}")
+        if st.button("목록 불러오기"):
+            try:
+                st.code("\n".join(list_text_models()))
+            except Exception as e:
+                st.error(f"조회 실패: {e}")
+
+    st.divider()
+    carry_raw = st.checkbox(
+        "후속 질문에 원본 데이터 포함",
+        value=False,
+        help="켜면 정확하지만 매 질문마다 블로그 전체가 재전송되어 토큰 소모가 큽니다.",
+    )
 
     if st.button("🗑️ 캐시 비우기"):
         st.cache_data.clear()
         st.success("캐시를 비웠습니다.")
+
+    if st.button("🔄 대화 초기화"):
+        st.session_state.ctx = None
+        st.session_state.turns = []
+        st.rerun()
 
 mode = st.radio("어떤 목적으로 검색하시나요?", MODES)
 
@@ -326,18 +375,57 @@ if st.button("분석 시작하기", type="primary"):
         st.warning("검색어를 입력해주세요.")
     else:
         with st.spinner(f"[{mode}] 모드로 수집·분석 중입니다... ⏳"):
-            used_model, result, meta = analyze(query, mode, custom_instruction)
+            model_name, result, meta, prompt = run_analysis(query, mode, custom_instruction)
 
-        st.markdown("### 📊 분석 결과")
+        st.session_state.turns = []
+        st.session_state.ctx = {
+            "query": query,
+            "mode": mode,
+            "model": model_name,
+            "result": result,
+            "prompt": prompt,
+            "meta": meta,
+        }
 
-        bits = []
-        if used_model:
-            bits.append(f"모델 `{used_model}`")
-        if meta.get("count"):
-            bits.append(f"수집 {meta['count']}건")
-        if meta.get("tokens"):
-            bits.append(f"입력 {meta['tokens']:,} 토큰")
-        if bits:
-            st.caption(" · ".join(bits))
+# --- 결과 및 대화 표시 (세션 상태 기반이라 리런에도 유지됨) ---
+ctx = st.session_state.ctx
 
-        st.markdown(result)
+if ctx:
+    st.divider()
+    st.markdown("### 📊 분석 결과")
+
+    bits = []
+    if ctx["model"]:
+        bits.append(f"모델 `{ctx['model']}`")
+    if ctx["meta"].get("count"):
+        bits.append(f"수집 {ctx['meta']['count']}건")
+    if ctx["meta"].get("chars"):
+        bits.append(f"프롬프트 {ctx['meta']['chars']:,}자")
+    if bits:
+        st.caption(" · ".join(bits))
+
+    st.markdown(ctx["result"])
+
+    for q, a in st.session_state.turns:
+        with st.chat_message("user"):
+            st.markdown(q)
+        with st.chat_message("assistant"):
+            st.markdown(a)
+
+    if ctx.get("prompt"):   # 분석이 성공한 경우에만 후속 질문 허용
+        follow = st.chat_input("결과에 대해 이어서 질문해보세요")
+        if follow:
+            with st.chat_message("user"):
+                st.markdown(follow)
+            with st.chat_message("assistant"):
+                with st.spinner("생각 중..."):
+                    try:
+                        history = build_history(ctx, carry_raw)
+                        answer = continue_chat(history, follow, ctx["model"])
+                    except gexc.ResourceExhausted as e:
+                        answer = f"❌ 쿼터/결제 오류\n\n```\n{e.message}\n```"
+                    except Exception as e:
+                        answer = f"❌ 오류: {type(e).__name__}: {e}"
+                st.markdown(answer)
+
+            st.session_state.turns.append((follow, answer))
