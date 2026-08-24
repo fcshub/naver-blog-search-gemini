@@ -1,5 +1,5 @@
 """
-네이버 블로그 AI 분석기 v7 (최종)
+네이버 블로그 AI 분석기 v8 (최종)
 
 추가 설치:
     pip install streamlit requests google-generativeai beautifulsoup4 lxml
@@ -33,7 +33,9 @@ genai.configure(api_key=GEMINI_API_KEY)
 # ---------------------------------------------------------------------------
 # 설정
 # ---------------------------------------------------------------------------
+# 사이드바 기본 선택값 우선순위. 목록에 있는 첫 번째가 기본으로 잡힙니다.
 MODEL_PREFERENCES = [
+    "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
     "gemini-3.7-flash",
     "gemini-2.5-flash",
@@ -44,22 +46,18 @@ STAGE1_MAX_TOKENS = 8192
 MAX_RETRIES = 2
 RETRY_WAIT = 65
 
-# 수집: 관련도순 비중을 높여야 시기가 골고루 섞임
 SORT_PLAN = [("sim", 70), ("date", 30)]
 MAX_TOTAL_ITEMS = 100
 NAVER_DELAY = 0.15
 
-# 기간별 표본 비율 (최근 3개월 / 3개월~1년 / 1년 이상)
 STRATA_RATIO = {"recent": 0.4, "mid": 0.4, "old": 0.2}
 RECENT_DAYS = 90
 MID_DAYS = 365
 
-# 크롤링
 MAX_BODY_CHARS = 4000
 CRAWL_WORKERS = 4
 CRAWL_TIMEOUT = 8
 
-# 2단계 분석
 CHUNK_SIZE = 15
 
 UA = (
@@ -93,27 +91,29 @@ QUERY_SUFFIXES = {
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def list_text_models() -> list[str]:
-    return [
+    names = [
         m.name.removeprefix("models/")
         for m in genai.list_models()
         if "generateContent" in m.supported_generation_methods
     ]
+    # 실사용 가능성이 높은 순으로: flash → pro → 나머지
+    def rank(n: str) -> tuple:
+        low = n.lower()
+        tier = 0 if "flash" in low else (1 if "pro" in low else 2)
+        m = re.search(r"(\d+(?:\.\d+)?)", n)
+        return (tier, -(float(m.group(1)) if m else 0.0), n)
+
+    return sorted(names, key=rank)
 
 
-def resolve_model() -> str:
-    available = list_text_models()
+def default_model_index(available: list[str]) -> int:
     for name in MODEL_PREFERENCES:
         if name in available:
-            return name
-
-    def ver(n: str) -> float:
-        m = re.search(r"(\d+(?:\.\d+)?)", n)
-        return float(m.group(1)) if m else 0.0
-
-    flash = [n for n in available if "flash" in n.lower()]
-    if flash:
-        return max(flash, key=ver)
-    raise RuntimeError(f"flash 계열 모델 없음. 접근 가능: {available}")
+            return available.index(name)
+    for i, n in enumerate(available):
+        if "flash" in n.lower():
+            return i
+    return 0
 
 
 def make_model(name: str, max_tokens: int = MAX_OUTPUT_TOKENS):
@@ -168,7 +168,6 @@ def age_days(item: dict, today: datetime) -> int:
 
 
 def stratify(items: list[dict], total: int) -> tuple[list[dict], dict]:
-    """시기가 한쪽으로 쏠리지 않도록 구간별 할당량을 두고 표본 추출."""
     today = datetime.now()
     buckets: dict[str, list[dict]] = {"recent": [], "mid": [], "old": []}
 
@@ -183,21 +182,20 @@ def stratify(items: list[dict], total: int) -> tuple[list[dict], dict]:
 
     quota = {k: int(total * r) for k, r in STRATA_RATIO.items()}
     picked: list[dict] = []
-    chosen_links: set[str] = set()
+    chosen: set[str] = set()
 
     for k in ("recent", "mid", "old"):
         buckets[k].sort(key=lambda b: b["date"], reverse=True)
         for b in buckets[k][:quota[k]]:
             picked.append(b)
-            chosen_links.add(b["link"])
+            chosen.add(b["link"])
 
-    # 할당량을 못 채운 구간이 있으면 남은 글로 보충
     if len(picked) < total:
-        rest = [b for b in items if b["link"] not in chosen_links]
+        rest = [b for b in items if b["link"] not in chosen]
         rest.sort(key=lambda b: b["date"], reverse=True)
         for b in rest[:total - len(picked)]:
             picked.append(b)
-            chosen_links.add(b["link"])
+            chosen.add(b["link"])
 
     picked.sort(key=lambda b: b["date"], reverse=True)
 
@@ -292,7 +290,6 @@ def collect(base_query: str, mode: str) -> tuple[list[dict], list[str], dict]:
                     "body": None,
                     "is_ad": False,
                 })
-
             time.sleep(NAVER_DELAY)
 
     pool_size = len(pool)
@@ -485,24 +482,19 @@ def continue_chat(history: list[dict], question: str, model_name: str) -> str:
 # ---------------------------------------------------------------------------
 # 파이프라인
 # ---------------------------------------------------------------------------
-def run_pipeline(query: str, mode: str, custom: str, progress, status):
+def run_pipeline(query: str, mode: str, custom: str, model_name: str, progress, status):
     meta: dict = {}
 
     status.write("① 네이버 검색 및 본문 수집 중...")
     try:
         items, queries, stats = collect(query, mode)
     except Exception as e:
-        return None, f"❌ 수집 실패: {type(e).__name__}: {e}", meta, None
+        return f"❌ 수집 실패: {type(e).__name__}: {e}", meta, None
     if not items:
-        return None, "⚠️ 검색 결과가 없습니다.", meta, None
+        return "⚠️ 검색 결과가 없습니다.", meta, None
 
     meta.update(stats)
     progress.progress(0.25)
-
-    try:
-        model_name = resolve_model()
-    except Exception as e:
-        return None, f"❌ 모델 확인 실패: {e}", meta, None
 
     # 1단계
     chunks = [items[i:i + CHUNK_SIZE] for i in range(0, len(items), CHUNK_SIZE)]
@@ -518,13 +510,13 @@ def run_pipeline(query: str, mode: str, custom: str, progress, status):
         except gexc.ResourceExhausted as e:
             failed += 1
             if not extracts:
-                return model_name, f"❌ 쿼터/결제 오류\n\n```\n{e.message}\n```", meta, None
+                return f"❌ 쿼터/결제 오류\n\n```\n{e.message}\n```", meta, None
         except Exception:
             failed += 1
         progress.progress(0.25 + 0.55 * i / n)
 
     if not extracts:
-        return model_name, "❌ 자료 추출에 모두 실패했습니다.", meta, None
+        return "❌ 자료 추출에 모두 실패했습니다.", meta, None
 
     meta["chunks"] = n
     meta["chunk_failed"] = failed
@@ -539,12 +531,12 @@ def run_pipeline(query: str, mode: str, custom: str, progress, status):
         result = call_model(p2, model_name)
     except gexc.ResourceExhausted as e:
         detail = "\n".join(str(d) for d in (getattr(e, "details", []) or []))
-        return model_name, f"❌ 쿼터/결제 오류\n\n```\n{e.message}\n\n{detail}\n```", meta, None
+        return f"❌ 쿼터/결제 오류\n\n```\n{e.message}\n\n{detail}\n```", meta, None
     except Exception as e:
-        return model_name, f"❌ 분석 오류: {type(e).__name__}: {e}", meta, None
+        return f"❌ 분석 오류: {type(e).__name__}: {e}", meta, None
 
     progress.progress(1.0)
-    return model_name, result, meta, extracts
+    return result, meta, extracts
 
 
 # ---------------------------------------------------------------------------
@@ -584,20 +576,31 @@ st.title("🔍 네이버 다목적 AI 분석기")
 st.caption("여러 시기의 블로그 본문을 균형 있게 수집해 2단계로 분석합니다.")
 
 with st.sidebar:
-    st.subheader("⚙️ 상태")
-    try:
-        st.success(f"모델: `{resolve_model()}`")
-    except Exception as e:
-        st.error(str(e))
+    st.subheader("🤖 모델")
 
-    with st.expander("사용 가능한 모델"):
-        if st.button("목록 불러오기"):
-            try:
-                st.code("\n".join(list_text_models()))
-            except Exception as e:
-                st.error(f"조회 실패: {e}")
+    try:
+        available = list_text_models()
+    except Exception as e:
+        available = []
+        st.error(f"모델 목록 조회 실패: {e}")
+
+    if available:
+        selected_model = st.selectbox(
+            "사용할 모델",
+            options=available,
+            index=default_model_index(available),
+            help="Lite 계열은 RPD 여유가 크고, 상위 모델은 정확도가 높습니다.",
+        )
+        st.caption(f"전체 {len(available)}개 모델 사용 가능")
+    else:
+        selected_model = st.text_input("모델 이름 직접 입력", value=MODEL_PREFERENCES[0])
+
+    if st.button("🔁 모델 목록 새로고침"):
+        list_text_models.clear()
+        st.rerun()
 
     st.divider()
+    st.subheader("⚙️ 설정")
     st.caption(
         f"수집 {MAX_TOTAL_ITEMS}건 · 본문 {MAX_BODY_CHARS:,}자\n\n"
         f"시기 배분 최근 {int(STRATA_RATIO['recent']*100)}% / "
@@ -634,18 +637,20 @@ if query.strip():
 if st.button("분석 시작하기", type="primary"):
     if not query.strip():
         st.warning("검색어를 입력해주세요.")
+    elif not selected_model:
+        st.warning("사용할 모델을 선택해주세요.")
     else:
         progress = st.progress(0.0)
         status = st.empty()
-        model_name, result, meta, extracts = run_pipeline(
-            query, mode, custom_instruction, progress, status
+        result, meta, extracts = run_pipeline(
+            query, mode, custom_instruction, selected_model, progress, status
         )
         progress.empty()
         status.empty()
 
         st.session_state.turns = []
         st.session_state.ctx = {
-            "query": query, "mode": mode, "model": model_name,
+            "query": query, "mode": mode, "model": selected_model,
             "result": result, "extracts": extracts, "meta": meta,
         }
 
@@ -656,9 +661,7 @@ if ctx:
     st.markdown("### 📊 분석 결과")
 
     m = ctx["meta"]
-    bits = []
-    if ctx["model"]:
-        bits.append(f"`{ctx['model']}`")
+    bits = [f"`{ctx['model']}`"]
     if m.get("total"):
         bits.append(f"수집 {m['total']}/{m.get('pool', '?')}건")
     if m.get("crawled") is not None:
@@ -667,8 +670,7 @@ if ctx:
         bits.append(f"협찬의심 {m['ads']}")
     if m.get("api_calls"):
         bits.append(f"호출 {m['api_calls']}회")
-    if bits:
-        st.caption(" · ".join(bits))
+    st.caption(" · ".join(bits))
 
     if m.get("dist"):
         d = m["dist"]
