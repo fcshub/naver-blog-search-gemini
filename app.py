@@ -16,6 +16,7 @@ genai.configure(api_key=GEMINI_API_KEY)
 # 설정
 # ---------------------------------------------------------------------------
 MODEL_PREFERENCES = [
+    "gemini-3.5-flash-lite",
     "gemini-3.7-flash",
     "gemini-2.5-flash",
 ]
