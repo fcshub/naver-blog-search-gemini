@@ -1,20 +1,22 @@
 """
-네이버 블로그 AI 분석기 v6 — 대량 수집 + 2단계 분석
+네이버 블로그 AI 분석기 v7 (최종)
 
 추가 설치:
-    pip install beautifulsoup4 lxml
+    pip install streamlit requests google-generativeai beautifulsoup4 lxml
 
 동작 개요
-  1) 확장 검색어로 최대 100건 수집
-  2) 100건 전부 본문 크롤링 (병렬)
-  3) 15건씩 묶어 각각 사실 추출  ← 1단계 (호출 여러 번)
-  4) 추출 결과를 합쳐 최종 분석  ← 2단계 (호출 1번)
+  1) 확장 검색어로 후보 수집
+  2) 기간별 층화 샘플링 (최근 40% / 3개월~1년 40% / 1년 이상 20%)
+  3) 선정된 글 전부 본문 크롤링 (병렬)
+  4) CHUNK_SIZE씩 묶어 사실 추출   ← 1단계
+  5) 추출 결과를 종합해 최종 분석  ← 2단계
 """
 
 import math
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 import google.generativeai as genai
 import requests
@@ -38,23 +40,27 @@ MODEL_PREFERENCES = [
 ]
 
 MAX_OUTPUT_TOKENS = 16384
+STAGE1_MAX_TOKENS = 8192
 MAX_RETRIES = 2
 RETRY_WAIT = 65
 
-# 수집
-SORT_PLAN = [("sim", 40), ("date", 60)]
+# 수집: 관련도순 비중을 높여야 시기가 골고루 섞임
+SORT_PLAN = [("sim", 70), ("date", 30)]
 MAX_TOTAL_ITEMS = 100
 NAVER_DELAY = 0.15
 
+# 기간별 표본 비율 (최근 3개월 / 3개월~1년 / 1년 이상)
+STRATA_RATIO = {"recent": 0.4, "mid": 0.4, "old": 0.2}
+RECENT_DAYS = 90
+MID_DAYS = 365
+
 # 크롤링
-CRAWL_TOP_N = 100
 MAX_BODY_CHARS = 4000
 CRAWL_WORKERS = 4
 CRAWL_TIMEOUT = 8
 
 # 2단계 분석
-CHUNK_SIZE = 15          # 1단계에서 한 번에 처리할 글 수
-STAGE1_MAX_TOKENS = 8192  # 사실 추출은 짧아도 됨
+CHUNK_SIZE = 15
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -149,6 +155,61 @@ def expand_queries(base: str, mode: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# 기간별 층화 샘플링
+# ---------------------------------------------------------------------------
+def age_days(item: dict, today: datetime) -> int:
+    d = item.get("date", "")
+    if len(d) != 8:
+        return 99999
+    try:
+        return (today - datetime.strptime(d, "%Y%m%d")).days
+    except ValueError:
+        return 99999
+
+
+def stratify(items: list[dict], total: int) -> tuple[list[dict], dict]:
+    """시기가 한쪽으로 쏠리지 않도록 구간별 할당량을 두고 표본 추출."""
+    today = datetime.now()
+    buckets: dict[str, list[dict]] = {"recent": [], "mid": [], "old": []}
+
+    for b in items:
+        a = age_days(b, today)
+        if a <= RECENT_DAYS:
+            buckets["recent"].append(b)
+        elif a <= MID_DAYS:
+            buckets["mid"].append(b)
+        else:
+            buckets["old"].append(b)
+
+    quota = {k: int(total * r) for k, r in STRATA_RATIO.items()}
+    picked: list[dict] = []
+    chosen_links: set[str] = set()
+
+    for k in ("recent", "mid", "old"):
+        buckets[k].sort(key=lambda b: b["date"], reverse=True)
+        for b in buckets[k][:quota[k]]:
+            picked.append(b)
+            chosen_links.add(b["link"])
+
+    # 할당량을 못 채운 구간이 있으면 남은 글로 보충
+    if len(picked) < total:
+        rest = [b for b in items if b["link"] not in chosen_links]
+        rest.sort(key=lambda b: b["date"], reverse=True)
+        for b in rest[:total - len(picked)]:
+            picked.append(b)
+            chosen_links.add(b["link"])
+
+    picked.sort(key=lambda b: b["date"], reverse=True)
+
+    dist = {
+        "recent": sum(1 for b in picked if age_days(b, today) <= RECENT_DAYS),
+        "mid": sum(1 for b in picked if RECENT_DAYS < age_days(b, today) <= MID_DAYS),
+        "old": sum(1 for b in picked if age_days(b, today) > MID_DAYS),
+    }
+    return picked, dist
+
+
+# ---------------------------------------------------------------------------
 # 크롤링
 # ---------------------------------------------------------------------------
 def to_mobile_url(link: str) -> str | None:
@@ -210,7 +271,7 @@ def detect_ad(text: str) -> bool:
 def collect(base_query: str, mode: str) -> tuple[list[dict], list[str], dict]:
     queries = expand_queries(base_query, mode)
     seen: set[str] = set()
-    items: list[dict] = []
+    pool: list[dict] = []
 
     for q in queries:
         for sort, display in SORT_PLAN:
@@ -223,7 +284,7 @@ def collect(base_query: str, mode: str) -> tuple[list[dict], list[str], dict]:
                 if not link or link in seen:
                     continue
                 seen.add(link)
-                items.append({
+                pool.append({
                     "title": _strip_tags(it.get("title", "")),
                     "desc": _strip_tags(it.get("description", "")),
                     "date": it.get("postdate", ""),
@@ -231,14 +292,14 @@ def collect(base_query: str, mode: str) -> tuple[list[dict], list[str], dict]:
                     "body": None,
                     "is_ad": False,
                 })
+
             time.sleep(NAVER_DELAY)
 
-    items.sort(key=lambda b: b["date"], reverse=True)
-    items = items[:MAX_TOTAL_ITEMS]
+    pool_size = len(pool)
+    items, dist = stratify(pool, MAX_TOTAL_ITEMS)
 
-    targets = items[:CRAWL_TOP_N]
     with ThreadPoolExecutor(max_workers=CRAWL_WORKERS) as ex:
-        futures = {ex.submit(fetch_body, it["link"]): it for it in targets}
+        futures = {ex.submit(fetch_body, it["link"]): it for it in items}
         for fut in as_completed(futures):
             it = futures[fut]
             body = fut.result()
@@ -247,11 +308,15 @@ def collect(base_query: str, mode: str) -> tuple[list[dict], list[str], dict]:
                 it["body"] = body[:MAX_BODY_CHARS]
 
     stats = {
+        "pool": pool_size,
         "total": len(items),
-        "attempted": len(targets),
         "crawled": sum(1 for i in items if i["body"]),
         "ads": sum(1 for i in items if i["is_ad"]),
-        "chars": sum(len(i["body"] or i["desc"]) for i in items),
+        "dist": dist,
+        "span": (
+            f"{items[-1]['date'][:6]}~{items[0]['date'][:6]}"
+            if items and len(items[0]["date"]) == 8 else "-"
+        ),
     }
     return items, queries, stats
 
@@ -272,7 +337,7 @@ def format_chunk(items: list[dict], offset: int) -> str:
 # ---------------------------------------------------------------------------
 # 프롬프트
 # ---------------------------------------------------------------------------
-STAGE1_INSTRUCTION = """당신은 자료 정리 담당입니다. 아직 최종 분석을 하지 마세요.
+STAGE1_INSTRUCTION = """당신은 자료 정리 담당입니다. 아직 최종 분석이나 추천을 하지 마세요.
 아래 블로그 글들에서 **사실 정보만** 추출해 구조화하세요.
 
 [추출 규칙]
@@ -282,10 +347,10 @@ STAGE1_INSTRUCTION = """당신은 자료 정리 담당입니다. 아직 최종 �
   · 위치·접근 정보 (주소, 역, 주차)
   · 긍정 평가 요지
   · 부정 평가·불만 사항
-  · 출처 번호와 작성 날짜
-- [협찬의심] 표시가 있는 글에서 나온 평가는 반드시 "(협찬)"이라고 표기하세요.
+  · 출처 번호와 작성 날짜 — 반드시 함께 적을 것
+- [협찬의심] 표시가 있는 글에서 나온 평가에는 "(협찬)"이라고 표기하세요.
 - 본문에 없는 내용은 절대 만들지 마세요. 해당 항목이 없으면 생략하세요.
-- 요약·의견·추천을 쓰지 말고, 사실만 나열하세요. 최종 판단은 다음 단계에서 합니다.
+- 요약·의견·추천을 쓰지 말고 사실만 나열하세요. 판단은 다음 단계에서 합니다.
 - 간결한 불릿 형식으로 쓰세요.
 """
 
@@ -295,10 +360,16 @@ STAGE2_RULES = """
 - 대괄호 숫자는 원본 글 번호입니다. 수치를 인용할 때 함께 표기하세요.
 - "(협찬)" 표시된 평가는 신뢰도를 낮춰 취급하되, 사실 정보는 그대로 써도 됩니다.
 
+[시기 해석]
+- 자료는 최근 글과 오래된 글이 의도적으로 섞여 있습니다. 각 항목의 날짜를 반드시 확인하세요.
+- 같은 대상에 대한 평가나 가격이 시기별로 달라졌다면 그 변화를 짚어주세요.
+- 오래된 정보와 최근 정보가 충돌하면 최근 쪽에 무게를 두되, 둘 다 제시하고 날짜를 밝히세요.
+- 특정 계절·시기에만 해당하는 내용(계절 메뉴, 성수기 혼잡)은 그 조건을 명시하세요.
+- 최근 12개월 내 언급이 전혀 없는 대상은 폐업·단종 가능성을 표시하세요.
+
 [공통 원칙]
 - 여러 묶음에 걸쳐 반복 등장한 항목을 우선하고, 몇 건에서 나왔는지 밝히세요.
 - 자료에 없는 내용은 추측하지 말고 "정보 없음"이라고 쓰세요.
-- 수치가 서로 다르게 나오면 둘 다 제시하고 날짜를 근거로 최신 쪽에 무게를 두세요.
 - 마지막에 "⚠️ 데이터 한계"를 두고 확인하지 못한 부분을 정리하세요.
 """
 
@@ -306,23 +377,24 @@ SYSTEM_PROMPTS = {
     MODES[0]: """
 [최종 분석 — 맛집/핫플]
 1. 추천 장소 5~7곳을 선정하고 각각 정리하세요.
-   · 언급 건수 · 대표 메뉴와 실제 가격 · 웨이팅 실태 · 주차 · 불만족 포인트
-2. 최근 12개월 내 언급이 없으면 폐업 가능성을 표시하세요.
-3. 협찬 글에만 근거한 추천이면 그 사실을 명시하세요.
-4. 마지막에 목적별 추천(가성비 / 분위기 / 웨이팅 없는 곳)을 짧게 덧붙이세요.
+   · 언급 건수와 언급 시기 범위
+   · 대표 메뉴와 실제 가격 (가격이 시기별로 다르면 변동을 표시)
+   · 웨이팅 실태 · 주차 · 불만족 포인트
+2. 협찬 글에만 근거한 추천이면 그 사실을 명시하세요.
+3. 마지막에 목적별 추천(가성비 / 분위기 / 웨이팅 없는 곳)을 짧게 덧붙이세요.
 """,
     MODES[1]: """
 [최종 분석 — IT/기술]
 1. 최신 동향과 장단점을 종합하세요.
 2. 실무자 관점의 문제점(이슈, 한계, 호환성)을 구체적 사례·수치와 함께 정리하세요.
 3. 버전·시점에 따라 평가가 갈린 지점을 날짜 근거로 짚으세요.
-4. 도입을 검토한다면 어떤 조건에서 적합하고 어떤 조건에서 부적합한지 정리하세요.
+4. 어떤 조건에서 적합하고 어떤 조건에서 부적합한지 정리하세요.
 """,
     MODES[2]: """
 [최종 분석 — 여행/데이트]
 1. 코스를 반나절/하루 단위로 묶어 2~3안 제안하고 이동 동선을 설명하세요.
 2. 입장료, 운영시간, 휴무일, 주차 요금을 출처 번호와 함께 명시하세요.
-3. 계절·시기별 주의사항, 혼잡도를 반영하세요.
+3. 계절·시기별 주의사항과 혼잡도를 반영하고, 어느 시기 자료인지 밝히세요.
 4. 예상 총 비용을 대략 계산해 제시하세요.
 """,
 }
@@ -342,11 +414,13 @@ def build_stage2_prompt(query: str, mode: str, extracts: list[str],
                         custom: str, queries: list[str], stats: dict) -> str:
     guide = SYSTEM_PROMPTS.get(mode, f"[사용자 특별 지침]\n{custom}")
     used = ", ".join(f"'{q}'" for q in queries)
+    d = stats["dist"]
     joined = "\n\n".join(
         f"===== 묶음 {i} =====\n{t}" for i, t in enumerate(extracts, 1)
     )
-    return f"""'{query}'에 대한 네이버 블로그 {stats['total']}건을 수집해
-1차 추출한 사실 목록입니다. (본문 확보 {stats['crawled']}건)
+    return f"""'{query}'에 대한 네이버 블로그 {stats['total']}건의 1차 추출 자료입니다.
+(본문 확보 {stats['crawled']}건 · 수집 시기 {stats['span']})
+시기 분포: 최근 3개월 {d['recent']}건 / 3개월~1년 {d['mid']}건 / 1년 이상 {d['old']}건
 검색어: {used}
 {STAGE2_RULES}
 {guide}
@@ -409,7 +483,7 @@ def continue_chat(history: list[dict], question: str, model_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 2단계 분석 실행
+# 파이프라인
 # ---------------------------------------------------------------------------
 def run_pipeline(query: str, mode: str, custom: str, progress, status):
     meta: dict = {}
@@ -430,7 +504,7 @@ def run_pipeline(query: str, mode: str, custom: str, progress, status):
     except Exception as e:
         return None, f"❌ 모델 확인 실패: {e}", meta, None
 
-    # --- 1단계: 묶음별 사실 추출 ---
+    # 1단계
     chunks = [items[i:i + CHUNK_SIZE] for i in range(0, len(items), CHUNK_SIZE)]
     n = len(chunks)
     extracts: list[str] = []
@@ -438,13 +512,12 @@ def run_pipeline(query: str, mode: str, custom: str, progress, status):
 
     for i, chunk in enumerate(chunks, 1):
         status.write(f"② 자료 추출 중... ({i}/{n} 묶음)")
-        offset = (i - 1) * CHUNK_SIZE
-        p = build_stage1_prompt(query, format_chunk(chunk, offset), i, n)
+        p = build_stage1_prompt(query, format_chunk(chunk, (i - 1) * CHUNK_SIZE), i, n)
         try:
             extracts.append(call_model(p, model_name, STAGE1_MAX_TOKENS))
         except gexc.ResourceExhausted as e:
             failed += 1
-            if not extracts:   # 첫 묶음부터 실패하면 중단
+            if not extracts:
                 return model_name, f"❌ 쿼터/결제 오류\n\n```\n{e.message}\n```", meta, None
         except Exception:
             failed += 1
@@ -457,7 +530,7 @@ def run_pipeline(query: str, mode: str, custom: str, progress, status):
     meta["chunk_failed"] = failed
     meta["api_calls"] = len(extracts) + 1
 
-    # --- 2단계: 종합 분석 ---
+    # 2단계
     status.write("③ 종합 분석 중...")
     p2 = build_stage2_prompt(query, mode, extracts, custom, queries, stats)
     meta["stage2_chars"] = len(p2)
@@ -506,9 +579,9 @@ def build_history(ctx: dict, carry_raw: bool) -> list[dict]:
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
-st.set_page_config(page_title="네이버 AI 분석기", page_icon="🔍", layout="centered")
+st.set_page_config(page_title="네이버 AI 분석기", page_icon="🔍")
 st.title("🔍 네이버 다목적 AI 분석기")
-st.caption("블로그 본문을 대량 수집해 2단계로 분석하고, 결과에 이어서 질문할 수 있습니다.")
+st.caption("여러 시기의 블로그 본문을 균형 있게 수집해 2단계로 분석합니다.")
 
 with st.sidebar:
     st.subheader("⚙️ 상태")
@@ -527,6 +600,9 @@ with st.sidebar:
     st.divider()
     st.caption(
         f"수집 {MAX_TOTAL_ITEMS}건 · 본문 {MAX_BODY_CHARS:,}자\n\n"
+        f"시기 배분 최근 {int(STRATA_RATIO['recent']*100)}% / "
+        f"중기 {int(STRATA_RATIO['mid']*100)}% / "
+        f"장기 {int(STRATA_RATIO['old']*100)}%\n\n"
         f"분석당 API 호출 약 {math.ceil(MAX_TOTAL_ITEMS / CHUNK_SIZE) + 1}회"
     )
     carry_raw = st.checkbox(
@@ -584,15 +660,23 @@ if ctx:
     if ctx["model"]:
         bits.append(f"`{ctx['model']}`")
     if m.get("total"):
-        bits.append(f"수집 {m['total']}건")
-    if m.get("attempted"):
-        bits.append(f"본문 {m.get('crawled', 0)}/{m['attempted']}")
+        bits.append(f"수집 {m['total']}/{m.get('pool', '?')}건")
+    if m.get("crawled") is not None:
+        bits.append(f"본문 {m['crawled']}건")
     if m.get("ads"):
         bits.append(f"협찬의심 {m['ads']}")
     if m.get("api_calls"):
         bits.append(f"호출 {m['api_calls']}회")
     if bits:
         st.caption(" · ".join(bits))
+
+    if m.get("dist"):
+        d = m["dist"]
+        st.caption(
+            f"시기 분포 — 최근 3개월 {d['recent']}건 · "
+            f"3개월~1년 {d['mid']}건 · 1년 이상 {d['old']}건 "
+            f"({m.get('span', '-')})"
+        )
 
     if m.get("chunk_failed"):
         st.warning(f"{m['chunk_failed']}개 묶음의 추출이 실패해 일부 자료가 빠졌습니다.")
