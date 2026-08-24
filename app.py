@@ -29,7 +29,7 @@ def analyze_naver_trend(query, mode, custom_instruction=""):
     raw_data = "\n".join(blog_texts)
     
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    model = genai.GenerativeModel('gemini-pro')
     
     # 2. 선택한 모드에 따라 제미나이에게 내릴 지시사항(프롬프트) 분기
     if mode == "🍽️ 맛집/핫플 탐색":
@@ -87,7 +87,7 @@ if mode == "✏️ 내 맘대로 직접 지시":
         "예: 최신 글들을 읽고, 사람들이 이 제품에 대해 가장 많이 묻는 질문 3가지만 정리해 줘."
     )
 
-query = st.text_input("검색어를 입력하세요 (예: 삼척 해변 맛집, ROS2 최신 동향 등)")
+query = st.text_input("검색어를 입력하세요")
 
 if st.button("분석 시작하기"):
     if query:
