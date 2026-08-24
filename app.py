@@ -7,22 +7,17 @@ NAVER_CLIENT_ID = st.secrets["NAVER_CLIENT_ID"]
 NAVER_CLIENT_SECRET = st.secrets["NAVER_CLIENT_SECRET"]
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 
-# --- [디버깅용 코드 추가] ---
-st.write(f"ID 로드 상태: {len(NAVER_CLIENT_ID)}자리 (정상: 20자리)")
-st.write(f"Secret 로드 상태: {len(NAVER_CLIENT_SECRET)}자리 (정상: 10자리)")
-# -----------------------------
-
 def analyze_naver_trend(query, mode, custom_instruction=""):
-    # 1. 네이버 블로그 검색 API 호출
-    url = f"https://openapi.naver.com/v1/search/blog.json?query={query}&display=30&sort=sim"
+    # [수정됨] 1. NAVER API HUB(네이버 클라우드) 신규 주소 및 헤더 규격 적용
+    url = f"https://naverapihub.apigw.ntruss.com/search/v1/blog?query={query}&display=30&sort=sim"
     headers = {
-        "X-Naver-Client-Id": NAVER_CLIENT_ID,
-        "X-Naver-Client-Secret": NAVER_CLIENT_SECRET
+        "X-NCP-APIGW-API-KEY-ID": NAVER_CLIENT_ID,
+        "X-NCP-APIGW-API-KEY": NAVER_CLIENT_SECRET
     }
     
     response = requests.get(url, headers=headers)
     if response.status_code != 200:
-        return f"네이버 API 연결 오류: {response.status_code}"
+        return f"네이버 API 연결 오류: {response.status_code}\n(응답 내용: {response.text})"
         
     data = response.json()
     blog_texts = []
@@ -77,16 +72,14 @@ def analyze_naver_trend(query, mode, custom_instruction=""):
 
 # --- 앱 화면(UI) 구성 ---
 st.set_page_config(page_title="네이버 다목적 분석기", page_icon="🔍")
-st.title("🔍 네이버 다목적 AI 분석기")
+st.title("🔍 네이버 다목적 AI 분석기 (API HUB 버전)")
 st.write("검색 목적에 맞춰 네이버 최신 글 30개를 똑똑하게 요약합니다.")
 
-# 모드 선택 버튼 (라디오 버튼)
 mode = st.radio(
     "어떤 목적으로 검색하시나요?", 
     ["🍽️ 맛집/핫플 탐색", "💻 IT/기술 동향 분석", "✈️ 여행/데이트 코스", "✏️ 내 맘대로 직접 지시"]
 )
 
-# 직접 지시 모드일 때만 나타나는 텍스트 입력 칸
 custom_instruction = ""
 if mode == "✏️ 내 맘대로 직접 지시":
     custom_instruction = st.text_area(
@@ -94,7 +87,7 @@ if mode == "✏️ 내 맘대로 직접 지시":
         "예: 최신 글들을 읽고, 사람들이 이 제품에 대해 가장 많이 묻는 질문 3가지만 정리해 줘."
     )
 
-query = st.text_input("검색어를 입력하세요 (예: 성수동 카페, ROS2 최신 동향, 삼척 쏠비치 등)")
+query = st.text_input("검색어를 입력하세요 (예: 삼척 해변 맛집, ROS2 최신 동향 등)")
 
 if st.button("분석 시작하기"):
     if query:
