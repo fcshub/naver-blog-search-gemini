@@ -15,17 +15,35 @@ genai.configure(api_key=GEMINI_API_KEY)
 # ---------------------------------------------------------------------------
 # 설정
 # ---------------------------------------------------------------------------
-# 위에서부터 순서대로 시도하고, 서버에 실제로 존재하는 첫 번째 모델을 사용합니다.
 MODEL_PREFERENCES = [
     "gemini-3.7-flash",
     "gemini-2.5-flash",
 ]
 
-MAX_DESC_CHARS = 2000    # 블로그 1건당 본문 상한 (네이버 원본이 짧아 사실상 미절단)
-DISPLAY_PER_SORT = 50    # 정렬 방식별 수집 건수 (관련도 30 + 최신 30)
-MAX_OUTPUT_TOKENS = 16384  # thinking 모델은 사고 토큰도 여기 포함되므로 넉넉히
-MAX_RETRIES = 2          # 429 발생 시 재시도 횟수
-RETRY_WAIT = 65          # TPM 윈도우(1분)가 지나야 의미가 있음
+MAX_DESC_CHARS = 2000
+MAX_TOTAL_ITEMS = 120      # 중복 제거 후 최종 상한 (토큰 폭주 방지)
+MAX_OUTPUT_TOKENS = 16384  # thinking 모델은 사고 토큰도 여기 포함됨
+MAX_RETRIES = 2
+RETRY_WAIT = 65            # TPM 윈도우가 1분이라 그보다 길게
+NAVER_DELAY = 0.15         # 연속 호출 간 간격 (초)
+
+# 정렬별 수집량: 최신순에 비중을 둠 (상업적 최적화가 덜 된 글이 많음)
+SORT_PLAN = [("sim", 20), ("date", 40)]
+
+MODES = [
+    "🍽️ 맛집/핫플 탐색",
+    "💻 IT/기술 동향 분석",
+    "✈️ 여행/데이트 코스",
+    "✏️ 내 맘대로 직접 지시",
+]
+
+# 모드별 검색어 확장 접미사. 부정·후기성 단어가 협찬글을 자연스럽게 걸러냄.
+QUERY_SUFFIXES = {
+    MODES[0]: ["", "후기", "웨이팅", "솔직"],
+    MODES[1]: ["", "후기", "단점", "문제"],
+    MODES[2]: ["", "후기", "코스", "주차"],
+    MODES[3]: ["", "후기"],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -33,7 +51,6 @@ RETRY_WAIT = 65          # TPM 윈도우(1분)가 지나야 의미가 있음
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def list_text_models() -> list[str]:
-    """generateContent를 지원하는 모델 이름 목록. 1시간 캐싱."""
     return [
         m.name.removeprefix("models/")
         for m in genai.list_models()
@@ -43,7 +60,6 @@ def list_text_models() -> list[str]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def resolve_model() -> str:
-    """선호 목록과 실제 사용 가능 목록을 대조해 쓸 모델을 결정."""
     available = list_text_models()
 
     for name in MODEL_PREFERENCES:
@@ -58,9 +74,7 @@ def resolve_model() -> str:
     if flash:
         return max(flash, key=version_of)
 
-    raise RuntimeError(
-        f"사용 가능한 flash 계열 모델이 없습니다. 접근 가능 모델: {available}"
-    )
+    raise RuntimeError(f"사용 가능한 flash 계열 모델이 없습니다. 접근 가능: {available}")
 
 
 # ---------------------------------------------------------------------------
@@ -83,28 +97,49 @@ def _fetch_once(query: str, sort: str, display: int) -> list[dict]:
     return res.json().get("items", [])
 
 
+def expand_queries(base: str, mode: str) -> list[str]:
+    """모드에 맞춰 검색어를 여러 각도로 확장."""
+    base = base.strip()
+    seen, out = set(), []
+    for suffix in QUERY_SUFFIXES.get(mode, ["", "후기"]):
+        q = f"{base} {suffix}".strip()
+        if q not in seen:
+            seen.add(q)
+            out.append(q)
+    return out
+
+
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_naver_blogs(query: str) -> list[dict]:
-    """관련도순 + 최신순을 함께 수집하고 링크 기준으로 중복 제거."""
-    items: list[dict] = []
-    for sort in ("sim", "date"):
-        items.extend(_fetch_once(query, sort, DISPLAY_PER_SORT))
+def collect_blogs(base_query: str, mode: str) -> tuple[list[dict], list[str]]:
+    """확장 검색어 × 정렬 조합으로 수집 후 링크 기준 중복 제거."""
+    queries = expand_queries(base_query, mode)
 
     seen: set[str] = set()
     result: list[dict] = []
-    for it in items:
-        link = it.get("link", "")
-        if link in seen:
-            continue
-        seen.add(link)
 
-        result.append({
-            "title": _strip_tags(it.get("title", "")),
-            "desc": _strip_tags(it.get("description", ""))[:MAX_DESC_CHARS],
-            "date": it.get("postdate", ""),
-            "blogger": _strip_tags(it.get("bloggername", "")),
-        })
-    return result
+    for q in queries:
+        for sort, display in SORT_PLAN:
+            try:
+                items = _fetch_once(q, sort, display)
+            except requests.RequestException:
+                continue  # 일부 쿼리 실패는 무시하고 계속
+
+            for it in items:
+                link = it.get("link", "")
+                if not link or link in seen:
+                    continue
+                seen.add(link)
+                result.append({
+                    "title": _strip_tags(it.get("title", "")),
+                    "desc": _strip_tags(it.get("description", ""))[:MAX_DESC_CHARS],
+                    "date": it.get("postdate", ""),
+                    "via": q,
+                })
+            time.sleep(NAVER_DELAY)
+
+    # 최신순 우선으로 정렬한 뒤 상한 적용
+    result.sort(key=lambda b: b["date"], reverse=True)
+    return result[:MAX_TOTAL_ITEMS], queries
 
 
 def format_blogs(blogs: list[dict]) -> str:
@@ -119,37 +154,50 @@ def format_blogs(blogs: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 # 프롬프트
 # ---------------------------------------------------------------------------
+COMMON_RULES = """
+[공통 원칙]
+- 아래 데이터는 블로그 '본문'이 아니라 검색 결과의 짧은 요약문입니다. 정보가 부족한 항목이 많은 것이 정상입니다.
+- 데이터에 없는 내용은 절대 추측하거나 지어내지 마세요. 근거가 없으면 "정보 부족"이라고 명시하세요.
+- 협찬·체험단으로 의심되는 글도 버리지 말고 활용하되, 용도를 구분하세요.
+  · 사실 정보(메뉴, 가격, 위치, 영업시간, 주차)는 그대로 인용해도 됩니다.
+  · 평가·감상(맛있다, 분위기 좋다)은 신뢰도를 낮춰 취급하고, 필요하면 협찬 의심을 짧게 표시하세요.
+- 여러 항목에서 반복 언급된 내용을 우선하고, 몇 건에서 나왔는지 밝히세요. 단일 출처면 그렇다고 쓰세요.
+- 마지막에 "⚠️ 데이터 한계" 항목을 두고, 이번 분석에서 확인하지 못한 부분을 2~3줄로 정리하세요.
+"""
+
 SYSTEM_PROMPTS = {
-    "🍽️ 맛집/핫플 탐색": """
-[필수 지침]
-1. 각 항목의 작성 날짜를 반드시 참고하세요. 최근 6개월 내 언급이 없는 곳은 폐업 가능성이 있으므로 추천에서 제외하거나 주의 표시를 하세요.
-2. '협찬', '소정의 원고료', '체험단' 등 마케팅 문구가 섞인 칭찬 일색의 글은 신뢰도를 낮춰 취급하세요.
-3. 추천 장소 3~5곳을 선정하고, 각각 인기 메뉴와 실제 불만족 포인트(웨이팅, 주차, 서비스 등)를 함께 정리하세요.
-4. 여러 글에서 반복적으로 언급된 곳을 우선하고, 몇 건에서 언급되었는지 밝히세요.
+    MODES[0]: """
+[분석 지침 — 맛집/핫플]
+1. 작성 날짜를 확인하세요. 최근 12개월 내 언급이 없는 곳은 폐업 가능성을 함께 표시하세요.
+2. 추천 장소 3~5곳을 선정하고 각각 다음을 정리하세요.
+   · 언급 건수 · 인기 메뉴와 가격대 · 불만족 포인트(웨이팅, 주차, 서비스)
+3. 불만족 언급이 데이터에 없으면 "언급 없음"이라고 쓰고, 없는 단점을 만들어내지 마세요.
 """,
-    "💻 IT/기술 동향 분석": """
-[필수 지침]
-1. 해당 기술/제품의 최신 동향과 장단점을 심층적으로 요약하세요.
-2. 실무자·개발자 관점에서 언급된 문제점(이슈, 한계점, 호환성)을 중심으로 분석하세요.
-3. 마케팅적 요소는 배제하고 객관적 팩트 위주로 정리하세요.
-4. 시점에 따라 평가가 달라진 부분이 있다면 날짜를 근거로 짚어주세요.
+    MODES[1]: """
+[분석 지침 — IT/기술]
+1. 해당 기술·제품의 최신 동향과 장단점을 요약하세요.
+2. 실무자·개발자 관점의 문제점(이슈, 한계, 호환성)을 중심으로 정리하세요.
+3. 시점에 따라 평가가 달라진 부분이 있으면 날짜를 근거로 짚어주세요.
+4. 마케팅 문구는 배제하고 검증 가능한 팩트 위주로 쓰세요.
 """,
-    "✈️ 여행/데이트 코스": """
-[필수 지침]
-1. 최신 후기를 바탕으로 가볼 만한 코스, 명소, 숙소를 추천하세요.
-2. 휴장 여부, 운영 시간 변동, 주차 팁 등 실질적 방문 정보를 포함하세요.
-3. 동선을 고려해 반나절/하루 코스로 묶어 제안하세요.
-4. 계절이나 시기에 따른 주의사항이 언급되었다면 반영하세요.
+    MODES[2]: """
+[분석 지침 — 여행/데이트]
+1. 가볼 만한 코스, 명소, 숙소를 추천하고 반나절/하루 단위로 묶어 제안하세요.
+2. 휴장 여부, 운영 시간, 주차 팁 등 실질적 방문 정보를 포함하세요.
+3. 계절·시기별 주의사항이 언급되었다면 반영하세요.
 """,
 }
 
 
-def build_prompt(query: str, mode: str, raw_data: str, custom: str) -> str:
-    system_prompt = SYSTEM_PROMPTS.get(mode, f"[사용자 특별 지침]\n{custom}")
-    return f"""다음은 '{query}'에 대해 네이버 블로그에서 수집한 검색 결과입니다.
-각 항목은 제목과 요약문이며, 괄호 안은 작성 날짜입니다.
+def build_prompt(query: str, mode: str, raw_data: str, custom: str, queries: list[str]) -> str:
+    guide = SYSTEM_PROMPTS.get(mode, f"[사용자 특별 지침]\n{custom}")
+    used = ", ".join(f"'{q}'" for q in queries)
 
-{system_prompt}
+    return f"""'{query}'에 대해 네이버 블로그를 검색한 결과입니다.
+실제 사용된 검색어: {used}
+각 항목은 제목과 요약문이며, 괄호 안은 작성 날짜입니다.
+{COMMON_RULES}
+{guide}
 
 [수집 데이터]
 {raw_data}
@@ -161,7 +209,6 @@ def build_prompt(query: str, mode: str, raw_data: str, custom: str) -> str:
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def count_tokens(prompt: str, model_name: str) -> int:
-    """무료 호출이며 쿼터를 소모하지 않음."""
     return genai.GenerativeModel(model_name).count_tokens(prompt).total_tokens
 
 
@@ -181,16 +228,14 @@ def generate(prompt: str, model_name: str) -> str:
                 return f"⚠️ 응답이 생성되지 않았습니다 (프롬프트 차단 가능성)\n\n```\n{fb}\n```"
 
             cand = resp.candidates[0]
-            text = "".join(
-                p.text for p in cand.content.parts if hasattr(p, "text")
-            )
+            text = "".join(p.text for p in cand.content.parts if hasattr(p, "text"))
 
             if not text.strip():
                 return (
                     "⚠️ 응답 본문이 비어 있습니다.\n\n"
                     f"- finish_reason: `{cand.finish_reason}`\n"
                     f"- usage: `{resp.usage_metadata}`\n\n"
-                    "`MAX_TOKENS`라면 코드 상단의 `MAX_OUTPUT_TOKENS`를 올리세요."
+                    "`MAX_TOKENS`라면 상단의 `MAX_OUTPUT_TOKENS`를 올리세요."
                 )
             return text
 
@@ -202,28 +247,26 @@ def generate(prompt: str, model_name: str) -> str:
     raise RuntimeError("unreachable")
 
 
-def analyze_naver_trend(query: str, mode: str, custom_instruction: str = ""):
-    """returns (model_name, result_text, meta)"""
+def analyze(query: str, mode: str, custom: str = ""):
     meta: dict = {}
 
     try:
-        blogs = fetch_naver_blogs(query)
-    except requests.HTTPError as e:
-        return None, f"❌ 네이버 API 오류 {e.response.status_code}\n\n{e.response.text}", meta
-    except requests.RequestException as e:
-        return None, f"❌ 네이버 API 요청 실패: {e}", meta
+        blogs, queries = collect_blogs(query, mode)
+    except Exception as e:
+        return None, f"❌ 네이버 검색 실패: {type(e).__name__}: {e}", meta
 
     if not blogs:
         return None, "⚠️ 검색 결과가 없습니다.", meta
 
     meta["count"] = len(blogs)
+    meta["queries"] = queries
 
     try:
         model_name = resolve_model()
     except Exception as e:
         return None, f"❌ 모델 확인 실패: {e}", meta
 
-    prompt = build_prompt(query, mode, format_blogs(blogs), custom_instruction)
+    prompt = build_prompt(query, mode, format_blogs(blogs), custom, queries)
 
     try:
         meta["tokens"] = count_tokens(prompt, model_name)
@@ -244,7 +287,7 @@ def analyze_naver_trend(query: str, mode: str, custom_instruction: str = ""):
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="네이버 AI 분석기", page_icon="🔍")
 st.title("🔍 네이버 다목적 AI 분석기")
-st.caption("네이버 블로그를 관련도순·최신순으로 함께 수집해 Gemini로 분석합니다.")
+st.caption("검색어를 여러 각도로 확장해 수집하고 Gemini로 분석합니다.")
 
 with st.sidebar:
     st.subheader("⚙️ 상태")
@@ -263,13 +306,10 @@ with st.sidebar:
         st.cache_data.clear()
         st.success("캐시를 비웠습니다.")
 
-mode = st.radio(
-    "어떤 목적으로 검색하시나요?",
-    ["🍽️ 맛집/핫플 탐색", "💻 IT/기술 동향 분석", "✈️ 여행/데이트 코스", "✏️ 내 맘대로 직접 지시"],
-)
+mode = st.radio("어떤 목적으로 검색하시나요?", MODES)
 
 custom_instruction = ""
-if mode == "✏️ 내 맘대로 직접 지시":
+if mode == MODES[3]:
     custom_instruction = st.text_area(
         "제미나이에게 내릴 분석 지시사항을 적어주세요.",
         placeholder="예: 가장 많이 언급되는 장점과 단점 3가지만 표로 정리해 줘.",
@@ -277,12 +317,15 @@ if mode == "✏️ 내 맘대로 직접 지시":
 
 query = st.text_input("검색어를 입력하세요", placeholder="예: 여의도 맛집 추천")
 
+if query.strip():
+    st.caption("확장 검색어: " + " · ".join(expand_queries(query, mode)))
+
 if st.button("분석 시작하기", type="primary"):
     if not query.strip():
         st.warning("검색어를 입력해주세요.")
     else:
-        with st.spinner(f"[{mode}] 모드로 분석 중입니다... ⏳"):
-            used_model, result, meta = analyze_naver_trend(query, mode, custom_instruction)
+        with st.spinner(f"[{mode}] 모드로 수집·분석 중입니다... ⏳"):
+            used_model, result, meta = analyze(query, mode, custom_instruction)
 
         st.markdown("### 📊 분석 결과")
 
