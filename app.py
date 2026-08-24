@@ -161,10 +161,8 @@ def analyze_naver_trend(query: str, mode: str, custom_instruction: str = ""):
     try:
         return model_name, generate(prompt, model_name)
     except gexc.ResourceExhausted as e:
-        return model_name, (
-            "⏳ **쿼터 한도(429)에 걸렸습니다.** 잠시 후 다시 시도해 주세요.\n\n"
-            f"```\n{e.message}\n```"
-        )
+        detail = "\n".join(str(d) for d in (getattr(e, "details", []) or []))
+        return model_name, f"```\n{e.message}\n\n{detail}\n\n{repr(e)}\n```"
     except Exception as e:
         return model_name, f"❌ 제미나이 분석 중 오류: {type(e).__name__}: {e}"
 
