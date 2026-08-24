@@ -7,6 +7,11 @@ NAVER_CLIENT_ID = st.secrets["NAVER_CLIENT_ID"]
 NAVER_CLIENT_SECRET = st.secrets["NAVER_CLIENT_SECRET"]
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 
+# --- [디버깅용 코드 추가] ---
+st.write(f"ID 로드 상태: {len(NAVER_CLIENT_ID)}자리 (정상: 20자리)")
+st.write(f"Secret 로드 상태: {len(NAVER_CLIENT_SECRET)}자리 (정상: 10자리)")
+# -----------------------------
+
 def analyze_naver_trend(query, mode, custom_instruction=""):
     # 1. 네이버 블로그 검색 API 호출
     url = f"https://openapi.naver.com/v1/search/blog.json?query={query}&display=30&sort=sim"
