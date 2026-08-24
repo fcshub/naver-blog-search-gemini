@@ -3,13 +3,12 @@ import requests
 import google.generativeai as genai
 import re
 
-# 클라우드 환경에서 비밀 열쇠를 안전하게 불러오는 코드
 NAVER_CLIENT_ID = st.secrets["NAVER_CLIENT_ID"]
 NAVER_CLIENT_SECRET = st.secrets["NAVER_CLIENT_SECRET"]
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 
-def analyze_naver_trend(query):
-    # 최근 1~2년 누적 정확도순(sim)으로 30개의 글 수집
+def analyze_naver_trend(query, mode, custom_instruction=""):
+    # 1. 네이버 블로그 검색 API 호출
     url = f"https://openapi.naver.com/v1/search/blog.json?query={query}&display=30&sort=sim"
     headers = {
         "X-Naver-Client-Id": NAVER_CLIENT_ID,
@@ -21,7 +20,6 @@ def analyze_naver_trend(query):
         return f"네이버 API 연결 오류: {response.status_code}"
         
     data = response.json()
-    
     blog_texts = []
     for item in data.get('items', []):
         clean_title = re.sub(r'<[^>]+>', '', item['title'])
@@ -33,15 +31,37 @@ def analyze_naver_trend(query):
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel('gemini-1.5-flash')
     
-    # 1~2년 누적 데이터 분석 및 영업 여부 교차 검증을 강력하게 지시하는 프롬프트
+    # 2. 선택한 모드에 따라 제미나이에게 내릴 지시사항(프롬프트) 분기
+    if mode == "🍽️ 맛집/핫플 탐색":
+        system_prompt = """
+        [필수 지침]
+        1. 과거에는 유명했으나 최근 리뷰가 끊겨 폐업이 의심되는 곳은 절대 추천하지 마세요. (현재 영업 중인 곳만)
+        2. '협찬', '소정의 원고료' 등 마케팅 문구가 섞인 칭찬 일색의 내용은 배제하세요.
+        3. 추천 장소 2~3곳의 인기 메뉴와 방문자들의 실제 단점(웨이팅, 주차 등)을 솔직하게 요약하세요.
+        """
+    elif mode == "💻 IT/기술 동향 분석":
+        system_prompt = """
+        [필수 지침]
+        1. 검색된 리뷰와 문서들을 바탕으로 해당 기술/제품의 최신 동향과 장단점을 요약하세요.
+        2. 실무자나 개발자 관점에서 언급된 문제점(이슈, 한계점, 호환성)을 중심으로 분석하세요.
+        3. 마케팅적인 요소는 배제하고 객관적이고 기술적인 팩트 위주로 정리해 주세요.
+        """
+    elif mode == "✈️ 여행/데이트 코스":
+        system_prompt = """
+        [필수 지침]
+        1. 최신 후기를 바탕으로 가볼 만한 여행 코스, 명소, 숙소 등을 추천해 주세요.
+        2. 휴장 여부, 운영 시간 변동, 해변/관광지 규정, 주차 팁 등 실질적인 방문 정보를 꼭 포함하세요.
+        3. 커플 여행이나 데이트 관점에서 동선을 고려하여 장단점을 요약해 주세요.
+        """
+    else: # 직접 입력 모드
+        system_prompt = f"[사용자 특별 지침]\n{custom_instruction}"
+        
+    # 3. 최종 프롬프트 조립
     prompt = f"""
     다음은 '{query}'에 대해 네이버 블로그에서 정확도순으로 수집한 30개의 원문 데이터입니다.
-    이 데이터를 바탕으로 최근 1~2년간 꾸준히 사랑받은 지역 트렌드와 핫플레이스를 분석해 주세요.
+    이 데이터를 바탕으로 아래 지침에 따라 분석을 수행해 주세요.
     
-    [필수 지침]
-    1. 과거에는 유명했으나 최근 리뷰가 완전히 끊겨 영업 중단(폐업)이 의심되는 곳은 절대 추천하지 마세요. 모처럼 시간을 내어 방문했을 때 헛걸음하는 일이 없도록, 현재 확실히 운영 중인 곳만 추려야 합니다.
-    2. '소정의 원고료', '협찬' 등의 마케팅 문구가 들어간 칭찬 일색의 내용은 배제하세요.
-    3. 오랜 기간 검증된 진짜 핫플레이스 2~3곳을 선정하고, 인기 메뉴와 방문자들의 불만/주의사항(웨이팅, 주차, 동선 등)을 솔직하게 요약해 주세요.
+    {system_prompt}
     
     [수집된 네이버 원문 데이터]
     {raw_data}
@@ -50,17 +70,31 @@ def analyze_naver_trend(query):
     result = model.generate_content(prompt)
     return result.text
 
-# --- 앱 화면 디자인 부분 ---
-st.set_page_config(page_title="진짜 맛집/트렌드 분석기", page_icon="🕵️‍♂️")
-st.title("🕵️‍♂️ 네이버 찐 핫플 탐지기")
-st.write("광고를 거르고 최근 1~2년간 꾸준히 검증된 진짜 트렌드만 분석합니다.")
+# --- 앱 화면(UI) 구성 ---
+st.set_page_config(page_title="네이버 다목적 분석기", page_icon="🔍")
+st.title("🔍 네이버 다목적 AI 분석기")
+st.write("검색 목적에 맞춰 네이버 최신 글 30개를 똑똑하게 요약합니다.")
 
-query = st.text_input("검색어를 입력하세요 (예: 강원도 해변 근처 맛집)")
+# 모드 선택 버튼 (라디오 버튼)
+mode = st.radio(
+    "어떤 목적으로 검색하시나요?", 
+    ["🍽️ 맛집/핫플 탐색", "💻 IT/기술 동향 분석", "✈️ 여행/데이트 코스", "✏️ 내 맘대로 직접 지시"]
+)
+
+# 직접 지시 모드일 때만 나타나는 텍스트 입력 칸
+custom_instruction = ""
+if mode == "✏️ 내 맘대로 직접 지시":
+    custom_instruction = st.text_area(
+        "제미나이에게 내릴 분석 지시사항을 적어주세요.", 
+        "예: 최신 글들을 읽고, 사람들이 이 제품에 대해 가장 많이 묻는 질문 3가지만 정리해 줘."
+    )
+
+query = st.text_input("검색어를 입력하세요 (예: 성수동 카페, ROS2 최신 동향, 삼척 쏠비치 등)")
 
 if st.button("분석 시작하기"):
     if query:
-        with st.spinner("네이버 블로그 30개를 긁어와 꼼꼼히 분석 중입니다... ⏳ (약 10초)"):
-            result = analyze_naver_trend(query)
+        with st.spinner(f"[{mode}] 모드로 네이버 데이터를 분석 중입니다... ⏳"):
+            result = analyze_naver_trend(query, mode, custom_instruction)
             st.markdown("### 📊 분석 결과")
             st.info(result)
     else:
