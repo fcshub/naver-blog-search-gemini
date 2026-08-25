@@ -597,6 +597,24 @@ with st.sidebar:
             index=default_model_index(available),
             help="Lite 계열은 RPD 여유가 크고, 상위 모델은 정확도가 높습니다.",
         )
+        
+        # --- 선택된 모델의 무료 한도(Tier 0) 표시 로직 ---
+        free_limits = {
+            "3.5-flash-lite": "🟢 하루 1,000회 / 분당 15회",
+            "2.5-flash": "🟢 하루 1,500회 / 분당 15회",
+            "3.5-flash": "🔴 하루 20회 / 분당 5회",
+            "3.7-flash": "🔴 하루 20회 / 분당 5회",
+            "pro": "🔴 하루 50회 / 분당 2회"
+        }
+        
+        limit_text = "일일 및 분당 한도 제한 있음" # 기본값
+        for key, text in free_limits.items():
+            if key in selected_model.lower():
+                limit_text = text
+                break
+                
+        st.info(f"**현재 모델 무료 한도**\n\n{limit_text}")
+        
         st.caption(f"전체 {len(available)}개 모델 사용 가능")
     else:
         selected_model = st.text_input("모델 이름 직접 입력", value=MODEL_PREFERENCES[0])
