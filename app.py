@@ -433,10 +433,10 @@ def build_stage2_prompt(query: str, mode: str, extracts: list[str],
 
 def build_light_context(query: str, mode: str, result: str) -> str:
     return f"""'{query}'에 대해 네이버 블로그를 대량 수집하고 [{mode}] 관점으로 분석한 결과입니다.
-이어지는 질문에는 아래 내용을 근거로 답하세요.
-여기 없는 내용은 추측하지 말고 "원본 자료에 없어 답변할 수 없습니다"라고 하세요.
+이 분석 결과를 바탕으로 사용자의 후속 질문에 친절하게 답변해 주세요.
+만약 요약된 결과에 명시되지 않은 세부 정보를 묻는다면, "수집된 요약본에는 해당 내용이 없지만, 일반적인 정보로는..." 형태로 당신의 배경 지식을 활용해 유연하게 조언해 주세요.
 
-[분석 결과]
+[분석 결과 요약]
 {result}
 """
 
