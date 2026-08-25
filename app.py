@@ -1,15 +1,15 @@
 """
-네이버 블로그 AI 분석기 v8 (최종 통합본)
+네이버 블로그 & 지도 통합 AI 분석기 v9
 
 추가 설치:
     pip install streamlit requests google-generativeai beautifulsoup4 lxml
 
 동작 개요
-  1) 확장 검색어로 후보 수집 (핵심 키워드 기반)
-  2) 기간별 층화 샘플링 (최근 40% / 3개월~1년 40% / 1년 이상 20%)
-  3) 선정된 글 전부 본문 크롤링 (병렬)
-  4) CHUNK_SIZE씩 묶어 사실 추출   ← 1단계
-  5) 사용자 세부 지시사항을 최우선 반영하여 종합 분석  ← 2단계
+  1) 확장 검색어로 블로그 후보 수집 + 지도(Local) 기본 정보 병행 수집
+  2) 기간별 층화 샘플링 (블로그)
+  3) 선정된 글 전부 본문 크롤링
+  4) CHUNK_SIZE씩 묶어 사실 추출 (블로그 텍스트)
+  5) 블로그 추출 내용 + 지도 팩트 정보를 합쳐 최종 분석
 """
 
 import math
@@ -121,13 +121,13 @@ def make_model(name: str, max_tokens: int = MAX_OUTPUT_TOKENS):
 
 
 # ---------------------------------------------------------------------------
-# 네이버 검색
+# 네이버 검색 (블로그 & 장소 통합)
 # ---------------------------------------------------------------------------
 def _strip_tags(s: str) -> str:
     return re.sub(r"<[^>]+>", "", s or "").strip()
 
 
-def _search_once(query: str, sort: str, display: int) -> list[dict]:
+def _search_blog(query: str, sort: str, display: int) -> list[dict]:
     res = requests.get(
         "https://naverapihub.apigw.ntruss.com/search/v1/blog",
         headers={
@@ -139,6 +139,25 @@ def _search_once(query: str, sort: str, display: int) -> list[dict]:
     )
     res.raise_for_status()
     return res.json().get("items", [])
+
+
+# [신규 추가] 네이버 지역/지도 검색 API
+def _search_local(query: str, display: int = 5) -> list[dict]:
+    try:
+        res = requests.get(
+            "https://naverapihub.apigw.ntruss.com/search/v1/local",
+            headers={
+                "X-NCP-APIGW-API-KEY-ID": NAVER_CLIENT_ID,
+                "X-NCP-APIGW-API-KEY": NAVER_CLIENT_SECRET,
+            },
+            params={"query": query, "display": display},
+            timeout=10,
+        )
+        if res.status_code == 200:
+            return res.json().get("items", [])
+    except Exception:
+        pass
+    return []
 
 
 def expand_queries(base: str, mode: str) -> list[str]:
@@ -264,15 +283,16 @@ def detect_ad(text: str) -> bool:
 # 수집 파이프라인
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=1800, show_spinner=False)
-def collect(base_query: str, mode: str) -> tuple[list[dict], list[str], dict]:
+def collect(base_query: str, mode: str) -> tuple[list[dict], str, list[str], dict]:
     queries = expand_queries(base_query, mode)
     seen: set[str] = set()
     pool: list[dict] = []
 
+    # 1. 블로그 데이터 수집
     for q in queries:
         for sort, display in SORT_PLAN:
             try:
-                raw = _search_once(q, sort, display)
+                raw = _search_blog(q, sort, display)
             except requests.RequestException:
                 continue
             for it in raw:
@@ -290,6 +310,22 @@ def collect(base_query: str, mode: str) -> tuple[list[dict], list[str], dict]:
                 })
             time.sleep(NAVER_DELAY)
 
+    # 2. 지역/지도 데이터 수집 (팩트 보강용)
+    local_text = ""
+    local_count = 0
+    local_raw = _search_local(base_query, display=5)
+    
+    if local_raw:
+        lines = []
+        for it in local_raw:
+            title = _strip_tags(it.get("title", ""))
+            cate = _strip_tags(it.get("category", ""))
+            addr = _strip_tags(it.get("roadAddress", "") or it.get("address", ""))
+            lines.append(f"- 상호/장소: {title} | 분류: {cate} | 주소: {addr}")
+        local_text = "\n".join(lines)
+        local_count = len(local_raw)
+
+    # 3. 블로그 크롤링 및 층화 추출
     pool_size = len(pool)
     items, dist = stratify(pool, MAX_TOTAL_ITEMS)
 
@@ -312,8 +348,10 @@ def collect(base_query: str, mode: str) -> tuple[list[dict], list[str], dict]:
             f"{items[-1]['date'][:6]}~{items[0]['date'][:6]}"
             if items and len(items[0]["date"]) == 8 else "-"
         ),
+        "local_count": local_count
     }
-    return items, queries, stats
+    
+    return items, local_text, queries, stats
 
 
 def format_chunk(items: list[dict], offset: int) -> str:
@@ -351,19 +389,16 @@ STAGE1_INSTRUCTION = """당신은 자료 정리 담당입니다. 아직 최종 �
 
 STAGE2_RULES = """
 [데이터 성격]
-- 아래는 블로그 원문에서 1차로 추출한 사실 목록입니다. 여러 묶음으로 나뉘어 있으니 전체를 종합하세요.
-- 대괄호 숫자는 원본 글 번호입니다. 수치를 인용할 때 함께 표기하세요.
+- 아래는 1차 추출된 블로그 리뷰 사실 목록과, 네이버 지도 검색 팩트 정보입니다.
+- 대괄호 숫자는 블로그 원본 글 번호입니다. 수치를 인용할 때 함께 표기하세요.
 - "(협찬)" 표시된 평가는 신뢰도를 낮춰 취급하되, 사실 정보는 그대로 써도 됩니다.
 
 [시기 해석]
-- 자료는 최근 글과 오래된 글이 의도적으로 섞여 있습니다. 각 항목의 날짜를 반드시 확인하세요.
-- 같은 대상에 대한 평가나 가격이 시기별로 달라졌다면 그 변화를 짚어주세요.
+- 블로그 자료는 최근 글과 오래된 글이 의도적으로 섞여 있습니다. 각 항목의 날짜를 반드시 확인하세요.
 - 오래된 정보와 최근 정보가 충돌하면 최근 쪽에 무게를 두되, 둘 다 제시하고 날짜를 밝히세요.
-- 특정 계절·시기에만 해당하는 내용(계절 메뉴, 성수기 혼잡)은 그 조건을 명시하세요.
-- 최근 12개월 내 언급이 전혀 없는 대상은 폐업·단종 가능성을 표시하세요.
 
 [공통 원칙]
-- 여러 묶음에 걸쳐 반복 등장한 항목을 우선하고, 몇 건에서 나왔는지 밝히세요.
+- 참고할 블로그 자료가 아예 없더라도, "지도 기본 팩트 정보"가 존재한다면 이를 적극 활용하여 해당 장소/주제를 충실히 설명하세요.
 - 자료에 없는 내용은 추측하지 말고 "정보 없음"이라고 쓰세요.
 - 마지막에 "⚠️ 데이터 한계"를 두고 확인하지 못한 부분을 정리하세요.
 """
@@ -371,7 +406,7 @@ STAGE2_RULES = """
 SYSTEM_PROMPTS = {
     MODES[0]: """
 [최종 분석 — 맛집/핫플]
-1. 추천 장소 5~7곳을 선정하고 각각 정리하세요.
+1. 추천 장소 5~7곳을 선정하고 각각 정리하세요. (지도 정보의 주소 및 분류를 반드시 포함)
    · 언급 건수와 언급 시기 범위
    · 대표 메뉴와 실제 가격 (가격이 시기별로 다르면 변동을 표시)
    · 웨이팅 실태 · 주차 · 불만족 포인트
@@ -388,7 +423,7 @@ SYSTEM_PROMPTS = {
     MODES[2]: """
 [최종 분석 — 여행/데이트]
 1. 코스를 반나절/하루 단위로 묶어 2~3안 제안하고 이동 동선을 설명하세요.
-2. 입장료, 운영시간, 휴무일, 주차 요금을 출처 번호와 함께 명시하세요.
+2. 입장료, 운영시간, 휴무일, 주차 요금을 출처 번호 및 지도 정보와 함께 명시하세요.
 3. 계절·시기별 주의사항과 혼잡도를 반영하고, 어느 시기 자료인지 밝히세요.
 4. 예상 총 비용을 대략 계산해 제시하세요.
 """,
@@ -406,33 +441,39 @@ def build_stage1_prompt(query: str, chunk_text: str, idx: int, total: int) -> st
 
 
 def build_stage2_prompt(query: str, mode: str, extracts: list[str],
-                        custom: str, queries: list[str], stats: dict) -> str:
-    # 기본 시스템 지침 가져오기
-    guide = SYSTEM_PROMPTS.get(mode, "")
+                        custom: str, queries: list[str], stats: dict, local_text: str) -> str:
     
-    # 사용자가 '추가 상황(custom)'을 입력했다면, 최우선 규칙으로 강제 주입
+    guide = SYSTEM_PROMPTS.get(mode, "")
     if custom.strip():
         guide += f"\n\n[사용자 특별 지침 (최우선 반영)]\n{custom}"
 
     used = ", ".join(f"'{q}'" for q in queries)
-    d = stats["dist"]
-    joined = "\n\n".join(
+    d = stats.get("dist", {"recent": 0, "mid": 0, "old": 0})
+    
+    joined_blogs = "\n\n".join(
         f"===== 묶음 {i} =====\n{t}" for i, t in enumerate(extracts, 1)
-    )
-    return f"""'{query}'에 대한 네이버 블로그 {stats['total']}건의 1차 추출 자료입니다.
-(본문 확보 {stats['crawled']}건 · 수집 시기 {stats['span']})
-시기 분포: 최근 3개월 {d['recent']}건 / 3개월~1년 {d['mid']}건 / 1년 이상 {d['old']}건
+    ) if extracts else "수집된 블로그 리뷰/자료가 없습니다."
+
+    local_block = local_text if local_text else "검색된 장소/지도 팩트 정보가 없습니다."
+
+    return f"""'{query}'에 대한 통합 검색 1차 추출 자료입니다.
+(블로그 본문 확보 {stats['crawled']}건 · 수집 시기 {stats.get('span', '-')})
+블로그 시기 분포: 최근 3개월 {d['recent']}건 / 3개월~1년 {d['mid']}건 / 1년 이상 {d['old']}건
 검색어: {used}
+
 {STAGE2_RULES}
 {guide}
 
-[1차 추출 자료]
-{joined}
+[🗺️ 네이버 지도/장소 팩트 정보]
+{local_block}
+
+[📝 1차 추출 자료 (블로그 리뷰)]
+{joined_blogs}
 """
 
 
 def build_light_context(query: str, mode: str, result: str) -> str:
-    return f"""'{query}'에 대해 네이버 블로그를 대량 수집하고 [{mode}] 관점으로 분석한 결과입니다.
+    return f"""'{query}'에 대해 네이버 검색 결과를 대량 수집하고 [{mode}] 관점으로 분석한 결과입니다.
 이 분석 결과를 바탕으로 사용자의 후속 질문에 친절하게 답변해 주세요.
 만약 요약된 결과에 명시되지 않은 세부 정보를 묻는다면, "수집된 요약본에는 해당 내용이 없지만, 일반적인 정보로는..." 형태로 당신의 배경 지식을 활용해 유연하게 조언해 주세요.
 
@@ -489,47 +530,53 @@ def continue_chat(history: list[dict], question: str, model_name: str) -> str:
 def run_pipeline(query: str, mode: str, custom: str, model_name: str, progress, status):
     meta: dict = {}
 
-    status.write("① 네이버 검색 및 본문 수집 중...")
+    status.write("① 네이버 블로그 및 지도 통합 검색 중...")
     try:
-        items, queries, stats = collect(query, mode)
+        items, local_text, queries, stats = collect(query, mode)
     except Exception as e:
         return f"❌ 수집 실패: {type(e).__name__}: {e}", meta, None
-    if not items:
-        return "⚠️ 검색 결과가 없습니다.", meta, None
+
+    # 블로그와 지도 둘 다 결과가 없을 때만 차단
+    if not items and stats.get("local_count", 0) == 0:
+        return "⚠️ 블로그 및 장소/지도 검색 결과가 모두 없습니다.", meta, None
 
     meta.update(stats)
     progress.progress(0.25)
 
-    # 1단계
-    chunks = [items[i:i + CHUNK_SIZE] for i in range(0, len(items), CHUNK_SIZE)]
-    n = len(chunks)
-    extracts: list[str] = []
+    # 1단계 (블로그 추출)
+    extracts = []
     failed = 0
+    n = 0
 
-    for i, chunk in enumerate(chunks, 1):
-        status.write(f"② 자료 추출 중... ({i}/{n} 묶음)")
-        p = build_stage1_prompt(query, format_chunk(chunk, (i - 1) * CHUNK_SIZE), i, n)
-        try:
-            extracts.append(call_model(p, model_name, STAGE1_MAX_TOKENS))
-        except gexc.ResourceExhausted as e:
-            failed += 1
-            if not extracts:
-                err_msg = f"❌ 쿼터/결제 오류\n\n```\n{getattr(e, 'message', str(e))}\n```"
-                return err_msg, meta, None
-        except Exception:
-            failed += 1
-        progress.progress(0.25 + 0.55 * i / n)
-
-    if not extracts:
-        return "❌ 자료 추출에 모두 실패했습니다.", meta, None
+    if items:
+        chunks = [items[i:i + CHUNK_SIZE] for i in range(0, len(items), CHUNK_SIZE)]
+        n = len(chunks)
+        
+        for i, chunk in enumerate(chunks, 1):
+            status.write(f"② 블로그 자료 추출 중... ({i}/{n} 묶음)")
+            p = build_stage1_prompt(query, format_chunk(chunk, (i - 1) * CHUNK_SIZE), i, n)
+            try:
+                extracts.append(call_model(p, model_name, STAGE1_MAX_TOKENS))
+            except gexc.ResourceExhausted as e:
+                failed += 1
+                if not extracts:
+                    err_msg = f"❌ 쿼터/결제 오류\n\n```\n{getattr(e, 'message', str(e))}\n```"
+                    return err_msg, meta, None
+            except Exception:
+                failed += 1
+            progress.progress(0.25 + 0.55 * i / n)
+    else:
+        # 블로그 정보가 아예 없는 경우
+        status.write("② 블로그 리뷰가 없어 지도 팩트 정보만으로 분석을 준비합니다...")
+        progress.progress(0.8)
 
     meta["chunks"] = n
     meta["chunk_failed"] = failed
     meta["api_calls"] = len(extracts) + 1
 
-    # 2단계
-    status.write("③ 종합 분석 중...")
-    p2 = build_stage2_prompt(query, mode, extracts, custom, queries, stats)
+    # 2단계 (종합 분석)
+    status.write("③ 최종 통합 분석 중...")
+    p2 = build_stage2_prompt(query, mode, extracts, custom, queries, stats, local_text)
     meta["stage2_chars"] = len(p2)
 
     try:
@@ -558,7 +605,7 @@ def build_history(ctx: dict, carry_raw: bool) -> list[dict]:
             f"===== 묶음 {i} =====\n{t}" for i, t in enumerate(ctx["extracts"], 1)
         )
         opener = (
-            f"'{ctx['query']}'에 대한 블로그 수집 자료의 1차 추출 결과입니다.\n"
+            f"'{ctx['query']}'에 대한 검색 수집 자료의 1차 추출 결과입니다.\n"
             f"이어지는 질문에 이 자료를 근거로 답하세요.\n\n{joined}"
         )
     else:
@@ -577,9 +624,9 @@ def build_history(ctx: dict, carry_raw: bool) -> list[dict]:
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
-st.set_page_config(page_title="네이버 AI 분석기", page_icon="🔍")
-st.title("🔍 네이버 다목적 AI 분석기")
-st.caption("여러 시기의 블로그 본문을 균형 있게 수집해 2단계로 분석합니다.")
+st.set_page_config(page_title="네이버 통합 AI 분석기", page_icon="🔍")
+st.title("🔍 네이버 다목적 AI 분석기 (지도 통합)")
+st.caption("블로그 본문 분석과 지도(Local) 팩트 정보를 결합하여 더욱 신뢰성 있는 결과를 제공합니다.")
 
 with st.sidebar:
     st.subheader("🤖 모델")
@@ -598,7 +645,7 @@ with st.sidebar:
             help="Lite 계열은 RPD 여유가 크고, 상위 모델은 정확도가 높습니다.",
         )
         
-        # --- 선택된 모델의 무료 한도(Tier 0) 표시 로직 ---
+        # --- 선택된 모델의 무료 한도 표시 ---
         free_limits = {
             "3.5-flash-lite": "🟢 하루 1,000회 / 분당 15회",
             "2.5-flash": "🟢 하루 1,500회 / 분당 15회",
@@ -607,7 +654,7 @@ with st.sidebar:
             "pro": "🔴 하루 50회 / 분당 2회"
         }
         
-        limit_text = "일일 및 분당 한도 제한 있음" # 기본값
+        limit_text = "일일 및 분당 한도 제한 있음"
         for key, text in free_limits.items():
             if key in selected_model.lower():
                 limit_text = text
@@ -647,10 +694,8 @@ with st.sidebar:
 
 mode = st.radio("어떤 목적으로 검색하시나요?", MODES)
 
-# 네이버 API가 좋아하는 짧은 키워드용 입력창
 query = st.text_input("🔍 네이버 검색어 (핵심 키워드만)", placeholder="예: 삼척 해변 맛집")
 
-# 제미나이(AI)에게 전달할 구체적인 상황 설명용 입력창 (모든 모드에서 노출)
 custom_instruction = st.text_area(
     "🗣️ 추가 상황 및 요청사항 (선택)",
     placeholder="예: 이번 주말에 여행 가는데, 주차하기 편하고 조용한 분위기인 곳으로 2~3곳만 골라줘."
@@ -688,22 +733,24 @@ if ctx:
     m = ctx["meta"]
     bits = [f"`{ctx['model']}`"]
     if m.get("total"):
-        bits.append(f"수집 {m['total']}/{m.get('pool', '?')}건")
+        bits.append(f"블로그 수집 {m['total']}/{m.get('pool', '?')}건")
     if m.get("crawled") is not None:
         bits.append(f"본문 {m['crawled']}건")
-    if m.get("ads"):
-        bits.append(f"협찬의심 {m['ads']}")
+    if m.get("local_count"):
+        bits.append(f"지도 연동 {m['local_count']}건")
     if m.get("api_calls"):
-        bits.append(f"호출 {m['api_calls']}회")
+        bits.append(f"API 호출 {m['api_calls']}회")
     st.caption(" · ".join(bits))
 
-    if m.get("dist"):
+    if m.get("dist") and m.get("total", 0) > 0:
         d = m["dist"]
         st.caption(
-            f"시기 분포 — 최근 3개월 {d['recent']}건 · "
+            f"블로그 시기 분포 — 최근 3개월 {d['recent']}건 · "
             f"3개월~1년 {d['mid']}건 · 1년 이상 {d['old']}건 "
             f"({m.get('span', '-')})"
         )
+    elif m.get("local_count", 0) > 0:
+        st.info("💡 블로그 리뷰 정보가 없어 네이버 지도 기본 정보만으로 분석되었습니다.")
 
     if m.get("chunk_failed"):
         st.warning(f"{m['chunk_failed']}개 묶음의 추출이 실패해 일부 자료가 빠졌습니다.")
@@ -711,7 +758,7 @@ if ctx:
     st.markdown(ctx["result"])
 
     if ctx.get("extracts"):
-        with st.expander("🔎 1차 추출 자료 보기"):
+        with st.expander("🔎 1차 추출 자료 보기 (블로그)"):
             for i, t in enumerate(ctx["extracts"], 1):
                 st.markdown(f"**묶음 {i}**")
                 st.markdown(t)
@@ -723,21 +770,21 @@ if ctx:
         with st.chat_message("assistant"):
             st.markdown(a)
 
-    if ctx.get("extracts"):
-        follow = st.chat_input("결과에 대해 이어서 질문해보세요")
-        if follow:
-            with st.chat_message("user"):
-                st.markdown(follow)
-            with st.chat_message("assistant"):
-                with st.spinner("생각 중..."):
-                    try:
-                        answer = continue_chat(
-                            build_history(ctx, carry_raw), follow, ctx["model"]
-                        )
-                    except gexc.ResourceExhausted as e:
-                        err_msg = f"❌ 쿼터/결제 오류\n\n```\n{getattr(e, 'message', str(e))}\n```"
-                        answer = err_msg
-                    except Exception as e:
-                        answer = f"❌ 오류: {type(e).__name__}: {e}"
-                st.markdown(answer)
-            st.session_state.turns.append((follow, answer))
+    # 추출 자료가 없어도(지도 정보만으로 분석했어도) 대화는 가능하도록 조건 완화
+    follow = st.chat_input("결과에 대해 이어서 질문해보세요")
+    if follow:
+        with st.chat_message("user"):
+            st.markdown(follow)
+        with st.chat_message("assistant"):
+            with st.spinner("생각 중..."):
+                try:
+                    answer = continue_chat(
+                        build_history(ctx, carry_raw), follow, ctx["model"]
+                    )
+                except gexc.ResourceExhausted as e:
+                    err_msg = f"❌ 쿼터/결제 오류\n\n```\n{getattr(e, 'message', str(e))}\n```"
+                    answer = err_msg
+                except Exception as e:
+                    answer = f"❌ 오류: {type(e).__name__}: {e}"
+            st.markdown(answer)
+        st.session_state.turns.append((follow, answer))
