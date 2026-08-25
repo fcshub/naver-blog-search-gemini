@@ -514,7 +514,8 @@ def run_pipeline(query: str, mode: str, custom: str, model_name: str, progress, 
         except gexc.ResourceExhausted as e:
             failed += 1
             if not extracts:
-                return f"❌ 쿼터/결제 오류\n\n```\n{e.message}\n```", meta, None
+                err_msg = f"❌ 쿼터/결제 오류\n\n```\n{getattr(e, 'message', str(e))}\n```"
+                return err_msg, meta, None
         except Exception:
             failed += 1
         progress.progress(0.25 + 0.55 * i / n)
@@ -535,4 +536,190 @@ def run_pipeline(query: str, mode: str, custom: str, model_name: str, progress, 
         result = call_model(p2, model_name)
     except gexc.ResourceExhausted as e:
         detail = "\n".join(str(d) for d in (getattr(e, "details", []) or []))
-        return f"❌ 쿼터/결제 오류\n\n```\n{e.message}\n\n{detail}\n
+        err_msg = f"❌ 쿼터/결제 오류\n\n```\n{getattr(e, 'message', str(e))}\n\n{detail}\n```"
+        return err_msg, meta, None
+    except Exception as e:
+        return f"❌ 분석 오류: {type(e).__name__}: {e}", meta, None
+
+    progress.progress(1.0)
+    return result, meta, extracts
+
+
+# ---------------------------------------------------------------------------
+# 세션 상태
+# ---------------------------------------------------------------------------
+st.session_state.setdefault("ctx", None)
+st.session_state.setdefault("turns", [])
+
+
+def build_history(ctx: dict, carry_raw: bool) -> list[dict]:
+    if carry_raw and ctx.get("extracts"):
+        joined = "\n\n".join(
+            f"===== 묶음 {i} =====\n{t}" for i, t in enumerate(ctx["extracts"], 1)
+        )
+        opener = (
+            f"'{ctx['query']}'에 대한 블로그 수집 자료의 1차 추출 결과입니다.\n"
+            f"이어지는 질문에 이 자료를 근거로 답하세요.\n\n{joined}"
+        )
+    else:
+        opener = build_light_context(ctx["query"], ctx["mode"], ctx["result"])
+
+    history = [
+        {"role": "user", "parts": [opener]},
+        {"role": "model", "parts": [ctx["result"]]},
+    ]
+    for q, a in st.session_state.turns:
+        history.append({"role": "user", "parts": [q]})
+        history.append({"role": "model", "parts": [a]})
+    return history
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+st.set_page_config(page_title="네이버 AI 분석기", page_icon="🔍")
+st.title("🔍 네이버 다목적 AI 분석기")
+st.caption("여러 시기의 블로그 본문을 균형 있게 수집해 2단계로 분석합니다.")
+
+with st.sidebar:
+    st.subheader("🤖 모델")
+
+    try:
+        available = list_text_models()
+    except Exception as e:
+        available = []
+        st.error(f"모델 목록 조회 실패: {e}")
+
+    if available:
+        selected_model = st.selectbox(
+            "사용할 모델",
+            options=available,
+            index=default_model_index(available),
+            help="Lite 계열은 RPD 여유가 크고, 상위 모델은 정확도가 높습니다.",
+        )
+        st.caption(f"전체 {len(available)}개 모델 사용 가능")
+    else:
+        selected_model = st.text_input("모델 이름 직접 입력", value=MODEL_PREFERENCES[0])
+
+    if st.button("🔁 모델 목록 새로고침"):
+        list_text_models.clear()
+        st.rerun()
+
+    st.divider()
+    st.subheader("⚙️ 설정")
+    st.caption(
+        f"수집 {MAX_TOTAL_ITEMS}건 · 본문 {MAX_BODY_CHARS:,}자\n\n"
+        f"시기 배분 최근 {int(STRATA_RATIO['recent']*100)}% / "
+        f"중기 {int(STRATA_RATIO['mid']*100)}% / "
+        f"장기 {int(STRATA_RATIO['old']*100)}%\n\n"
+        f"분석당 API 호출 약 {math.ceil(MAX_TOTAL_ITEMS / CHUNK_SIZE) + 1}회"
+    )
+    carry_raw = st.checkbox(
+        "후속 질문에 추출 자료 포함", value=False,
+        help="켜면 정확하지만 매 질문마다 토큰 소모가 큽니다.",
+    )
+
+    if st.button("🗑️ 캐시 비우기"):
+        st.cache_data.clear()
+        st.success("캐시를 비웠습니다.")
+    if st.button("🔄 대화 초기화"):
+        st.session_state.ctx = None
+        st.session_state.turns = []
+        st.rerun()
+
+mode = st.radio("어떤 목적으로 검색하시나요?", MODES)
+
+# 네이버 API가 좋아하는 짧은 키워드용 입력창
+query = st.text_input("🔍 네이버 검색어 (핵심 키워드만)", placeholder="예: 삼척 해변 맛집")
+
+# 제미나이(AI)에게 전달할 구체적인 상황 설명용 입력창 (모든 모드에서 노출)
+custom_instruction = st.text_area(
+    "🗣️ 추가 상황 및 요청사항 (선택)",
+    placeholder="예: 이번 주말에 여행 가는데, 주차하기 편하고 조용한 분위기인 곳으로 2~3곳만 골라줘."
+)
+
+if query.strip():
+    st.caption("확장 검색어: " + " · ".join(expand_queries(query, mode)))
+
+if st.button("분석 시작하기", type="primary"):
+    if not query.strip():
+        st.warning("검색어를 입력해주세요.")
+    elif not selected_model:
+        st.warning("사용할 모델을 선택해주세요.")
+    else:
+        progress = st.progress(0.0)
+        status = st.empty()
+        result, meta, extracts = run_pipeline(
+            query, mode, custom_instruction, selected_model, progress, status
+        )
+        progress.empty()
+        status.empty()
+
+        st.session_state.turns = []
+        st.session_state.ctx = {
+            "query": query, "mode": mode, "model": selected_model,
+            "result": result, "extracts": extracts, "meta": meta,
+        }
+
+ctx = st.session_state.ctx
+
+if ctx:
+    st.divider()
+    st.markdown("### 📊 분석 결과")
+
+    m = ctx["meta"]
+    bits = [f"`{ctx['model']}`"]
+    if m.get("total"):
+        bits.append(f"수집 {m['total']}/{m.get('pool', '?')}건")
+    if m.get("crawled") is not None:
+        bits.append(f"본문 {m['crawled']}건")
+    if m.get("ads"):
+        bits.append(f"협찬의심 {m['ads']}")
+    if m.get("api_calls"):
+        bits.append(f"호출 {m['api_calls']}회")
+    st.caption(" · ".join(bits))
+
+    if m.get("dist"):
+        d = m["dist"]
+        st.caption(
+            f"시기 분포 — 최근 3개월 {d['recent']}건 · "
+            f"3개월~1년 {d['mid']}건 · 1년 이상 {d['old']}건 "
+            f"({m.get('span', '-')})"
+        )
+
+    if m.get("chunk_failed"):
+        st.warning(f"{m['chunk_failed']}개 묶음의 추출이 실패해 일부 자료가 빠졌습니다.")
+
+    st.markdown(ctx["result"])
+
+    if ctx.get("extracts"):
+        with st.expander("🔎 1차 추출 자료 보기"):
+            for i, t in enumerate(ctx["extracts"], 1):
+                st.markdown(f"**묶음 {i}**")
+                st.markdown(t)
+                st.divider()
+
+    for q, a in st.session_state.turns:
+        with st.chat_message("user"):
+            st.markdown(q)
+        with st.chat_message("assistant"):
+            st.markdown(a)
+
+    if ctx.get("extracts"):
+        follow = st.chat_input("결과에 대해 이어서 질문해보세요")
+        if follow:
+            with st.chat_message("user"):
+                st.markdown(follow)
+            with st.chat_message("assistant"):
+                with st.spinner("생각 중..."):
+                    try:
+                        answer = continue_chat(
+                            build_history(ctx, carry_raw), follow, ctx["model"]
+                        )
+                    except gexc.ResourceExhausted as e:
+                        err_msg = f"❌ 쿼터/결제 오류\n\n```\n{getattr(e, 'message', str(e))}\n```"
+                        answer = err_msg
+                    except Exception as e:
+                        answer = f"❌ 오류: {type(e).__name__}: {e}"
+                st.markdown(answer)
+            st.session_state.turns.append((follow, answer))
