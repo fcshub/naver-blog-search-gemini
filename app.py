@@ -1,15 +1,15 @@
 """
-네이버 블로그 AI 분석기 v8 (최종)
+네이버 블로그 AI 분석기 v8 (최종 통합본)
 
 추가 설치:
     pip install streamlit requests google-generativeai beautifulsoup4 lxml
 
 동작 개요
-  1) 확장 검색어로 후보 수집
+  1) 확장 검색어로 후보 수집 (핵심 키워드 기반)
   2) 기간별 층화 샘플링 (최근 40% / 3개월~1년 40% / 1년 이상 20%)
   3) 선정된 글 전부 본문 크롤링 (병렬)
   4) CHUNK_SIZE씩 묶어 사실 추출   ← 1단계
-  5) 추출 결과를 종합해 최종 분석  ← 2단계
+  5) 사용자 세부 지시사항을 최우선 반영하여 종합 분석  ← 2단계
 """
 
 import math
@@ -33,7 +33,6 @@ genai.configure(api_key=GEMINI_API_KEY)
 # ---------------------------------------------------------------------------
 # 설정
 # ---------------------------------------------------------------------------
-# 사이드바 기본 선택값 우선순위. 목록에 있는 첫 번째가 기본으로 잡힙니다.
 MODEL_PREFERENCES = [
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
@@ -96,7 +95,6 @@ def list_text_models() -> list[str]:
         for m in genai.list_models()
         if "generateContent" in m.supported_generation_methods
     ]
-    # 실사용 가능성이 높은 순으로: flash → pro → 나머지
     def rank(n: str) -> tuple:
         low = n.lower()
         tier = 0 if "flash" in low else (1 if "pro" in low else 2)
@@ -409,7 +407,13 @@ def build_stage1_prompt(query: str, chunk_text: str, idx: int, total: int) -> st
 
 def build_stage2_prompt(query: str, mode: str, extracts: list[str],
                         custom: str, queries: list[str], stats: dict) -> str:
-    guide = SYSTEM_PROMPTS.get(mode, f"[사용자 특별 지침]\n{custom}")
+    # 기본 시스템 지침 가져오기
+    guide = SYSTEM_PROMPTS.get(mode, "")
+    
+    # 사용자가 '추가 상황(custom)'을 입력했다면, 최우선 규칙으로 강제 주입
+    if custom.strip():
+        guide += f"\n\n[사용자 특별 지침 (최우선 반영)]\n{custom}"
+
     used = ", ".join(f"'{q}'" for q in queries)
     d = stats["dist"]
     joined = "\n\n".join(
@@ -531,187 +535,4 @@ def run_pipeline(query: str, mode: str, custom: str, model_name: str, progress, 
         result = call_model(p2, model_name)
     except gexc.ResourceExhausted as e:
         detail = "\n".join(str(d) for d in (getattr(e, "details", []) or []))
-        return f"❌ 쿼터/결제 오류\n\n```\n{e.message}\n\n{detail}\n```", meta, None
-    except Exception as e:
-        return f"❌ 분석 오류: {type(e).__name__}: {e}", meta, None
-
-    progress.progress(1.0)
-    return result, meta, extracts
-
-
-# ---------------------------------------------------------------------------
-# 세션 상태
-# ---------------------------------------------------------------------------
-st.session_state.setdefault("ctx", None)
-st.session_state.setdefault("turns", [])
-
-
-def build_history(ctx: dict, carry_raw: bool) -> list[dict]:
-    if carry_raw and ctx.get("extracts"):
-        joined = "\n\n".join(
-            f"===== 묶음 {i} =====\n{t}" for i, t in enumerate(ctx["extracts"], 1)
-        )
-        opener = (
-            f"'{ctx['query']}'에 대한 블로그 수집 자료의 1차 추출 결과입니다.\n"
-            f"이어지는 질문에 이 자료를 근거로 답하세요.\n\n{joined}"
-        )
-    else:
-        opener = build_light_context(ctx["query"], ctx["mode"], ctx["result"])
-
-    history = [
-        {"role": "user", "parts": [opener]},
-        {"role": "model", "parts": [ctx["result"]]},
-    ]
-    for q, a in st.session_state.turns:
-        history.append({"role": "user", "parts": [q]})
-        history.append({"role": "model", "parts": [a]})
-    return history
-
-
-# ---------------------------------------------------------------------------
-# UI
-# ---------------------------------------------------------------------------
-st.set_page_config(page_title="네이버 AI 분석기", page_icon="🔍")
-st.title("🔍 네이버 다목적 AI 분석기")
-st.caption("여러 시기의 블로그 본문을 균형 있게 수집해 2단계로 분석합니다.")
-
-with st.sidebar:
-    st.subheader("🤖 모델")
-
-    try:
-        available = list_text_models()
-    except Exception as e:
-        available = []
-        st.error(f"모델 목록 조회 실패: {e}")
-
-    if available:
-        selected_model = st.selectbox(
-            "사용할 모델",
-            options=available,
-            index=default_model_index(available),
-            help="Lite 계열은 RPD 여유가 크고, 상위 모델은 정확도가 높습니다.",
-        )
-        st.caption(f"전체 {len(available)}개 모델 사용 가능")
-    else:
-        selected_model = st.text_input("모델 이름 직접 입력", value=MODEL_PREFERENCES[0])
-
-    if st.button("🔁 모델 목록 새로고침"):
-        list_text_models.clear()
-        st.rerun()
-
-    st.divider()
-    st.subheader("⚙️ 설정")
-    st.caption(
-        f"수집 {MAX_TOTAL_ITEMS}건 · 본문 {MAX_BODY_CHARS:,}자\n\n"
-        f"시기 배분 최근 {int(STRATA_RATIO['recent']*100)}% / "
-        f"중기 {int(STRATA_RATIO['mid']*100)}% / "
-        f"장기 {int(STRATA_RATIO['old']*100)}%\n\n"
-        f"분석당 API 호출 약 {math.ceil(MAX_TOTAL_ITEMS / CHUNK_SIZE) + 1}회"
-    )
-    carry_raw = st.checkbox(
-        "후속 질문에 추출 자료 포함", value=False,
-        help="켜면 정확하지만 매 질문마다 토큰 소모가 큽니다.",
-    )
-
-    if st.button("🗑️ 캐시 비우기"):
-        st.cache_data.clear()
-        st.success("캐시를 비웠습니다.")
-    if st.button("🔄 대화 초기화"):
-        st.session_state.ctx = None
-        st.session_state.turns = []
-        st.rerun()
-
-mode = st.radio("어떤 목적으로 검색하시나요?", MODES)
-
-custom_instruction = ""
-if mode == MODES[3]:
-    custom_instruction = st.text_area(
-        "제미나이에게 내릴 분석 지시사항을 적어주세요.",
-        placeholder="예: 가장 많이 언급되는 장점과 단점 3가지만 표로 정리해 줘.",
-    )
-
-query = st.text_input("검색어를 입력하세요", placeholder="예: 여의도 맛집 추천")
-if query.strip():
-    st.caption("확장 검색어: " + " · ".join(expand_queries(query, mode)))
-
-if st.button("분석 시작하기", type="primary"):
-    if not query.strip():
-        st.warning("검색어를 입력해주세요.")
-    elif not selected_model:
-        st.warning("사용할 모델을 선택해주세요.")
-    else:
-        progress = st.progress(0.0)
-        status = st.empty()
-        result, meta, extracts = run_pipeline(
-            query, mode, custom_instruction, selected_model, progress, status
-        )
-        progress.empty()
-        status.empty()
-
-        st.session_state.turns = []
-        st.session_state.ctx = {
-            "query": query, "mode": mode, "model": selected_model,
-            "result": result, "extracts": extracts, "meta": meta,
-        }
-
-ctx = st.session_state.ctx
-
-if ctx:
-    st.divider()
-    st.markdown("### 📊 분석 결과")
-
-    m = ctx["meta"]
-    bits = [f"`{ctx['model']}`"]
-    if m.get("total"):
-        bits.append(f"수집 {m['total']}/{m.get('pool', '?')}건")
-    if m.get("crawled") is not None:
-        bits.append(f"본문 {m['crawled']}건")
-    if m.get("ads"):
-        bits.append(f"협찬의심 {m['ads']}")
-    if m.get("api_calls"):
-        bits.append(f"호출 {m['api_calls']}회")
-    st.caption(" · ".join(bits))
-
-    if m.get("dist"):
-        d = m["dist"]
-        st.caption(
-            f"시기 분포 — 최근 3개월 {d['recent']}건 · "
-            f"3개월~1년 {d['mid']}건 · 1년 이상 {d['old']}건 "
-            f"({m.get('span', '-')})"
-        )
-
-    if m.get("chunk_failed"):
-        st.warning(f"{m['chunk_failed']}개 묶음의 추출이 실패해 일부 자료가 빠졌습니다.")
-
-    st.markdown(ctx["result"])
-
-    if ctx.get("extracts"):
-        with st.expander("🔎 1차 추출 자료 보기"):
-            for i, t in enumerate(ctx["extracts"], 1):
-                st.markdown(f"**묶음 {i}**")
-                st.markdown(t)
-                st.divider()
-
-    for q, a in st.session_state.turns:
-        with st.chat_message("user"):
-            st.markdown(q)
-        with st.chat_message("assistant"):
-            st.markdown(a)
-
-    if ctx.get("extracts"):
-        follow = st.chat_input("결과에 대해 이어서 질문해보세요")
-        if follow:
-            with st.chat_message("user"):
-                st.markdown(follow)
-            with st.chat_message("assistant"):
-                with st.spinner("생각 중..."):
-                    try:
-                        answer = continue_chat(
-                            build_history(ctx, carry_raw), follow, ctx["model"]
-                        )
-                    except gexc.ResourceExhausted as e:
-                        answer = f"❌ 쿼터/결제 오류\n\n```\n{e.message}\n```"
-                    except Exception as e:
-                        answer = f"❌ 오류: {type(e).__name__}: {e}"
-                st.markdown(answer)
-            st.session_state.turns.append((follow, answer))
+        return f"❌ 쿼터/결제 오류\n\n```\n{e.message}\n\n{detail}\n
